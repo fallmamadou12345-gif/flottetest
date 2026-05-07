@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: syndongo-test
+    env: node
+    buildCommand: npm install
+    startCommand: node serveur.js
+    envVars:
+      - key: DATA_PATH
+        value: /data/syndongo_test.json
+    disk:
+      name: syndongo-test-data
+      mountPath: /data
+      sizeGB: 1

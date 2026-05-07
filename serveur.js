@@ -1,0 +1,1449 @@
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const url = require('url');
+
+const DB_FILE = process.env.DATA_PATH || './syndongo_data.json';
+const PORT = process.env.PORT || 8000;
+
+// ── Helpers tags ──────────────────────────────────────────
+function normalizeTag(t) { return typeof t==='object' ? (t.nom||t.name||'') : String(t||''); }
+function normalizeTags(arr) { return [...new Set((arr||[]).map(normalizeTag).filter(Boolean))]; }
+
+
+const MANAGER_PASSWORD = process.env.MANAGER_PASSWORD || 'ndongo2026';
+
+// ── WAVE CONFIG ───────────────────────────────────────────────
+const WAVE_API_KEY = process.env.WAVE_API_KEY || '';
+const WAVE_WEBHOOK_SECRET = process.env.WAVE_WEBHOOK_SECRET || '';
+const APP_URL = process.env.APP_URL || 'https://syndongoflotte.onrender.com';
+
+// Créer une demande de paiement Wave (clé API = celle du gestionnaire ou du manager)
+async function createWavePayment(montant, phone, description, reference, apiKey) {
+  const key = apiKey || WAVE_API_KEY;
+  if (!key) return { error: 'Clé Wave non configurée — ajoutez votre clé dans Accès & Partage' };
+  try {
+    const https = require('https');
+    const body = JSON.stringify({
+      currency: 'XOF',
+      amount: montant.toString(),
+      error_url: APP_URL+'/api/wave/error',
+      success_url: APP_URL+'/api/wave/success',
+      client_reference: reference,
+      restrict_mobile: phone || undefined,
+      aggregated_merchant_id: null
+    });
+    return new Promise((resolve) => {
+      const req = https.request({
+        hostname: 'api.wave.com',
+        path: '/v1/checkout/sessions',
+        method: 'POST',
+        headers: {
+          'Authorization': 'Bearer '+key,
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body)
+        }
+      }, (res) => {
+        let data = '';
+        res.on('data', c => data += c);
+        res.on('end', () => {
+          try { resolve(JSON.parse(data)); }
+          catch(e) { resolve({ error: data }); }
+        });
+      });
+      req.on('error', e => resolve({ error: e.message }));
+      req.write(body);
+      req.end();
+    });
+  } catch(e) { return { error: e.message }; }
+}
+
+// Vérifier la signature webhook Wave
+function verifyWaveSignature(body, signature) {
+  if (!WAVE_WEBHOOK_SECRET) return true; // Pas de secret = pas de vérification
+  const crypto = require('crypto');
+  const expected = crypto.createHmac('sha256', WAVE_WEBHOOK_SECRET).update(body).digest('hex');
+  return signature === expected;
+}
+
+function loadDB() {
+  if (!fs.existsSync(DB_FILE)) {
+    const dir = path.dirname(DB_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(DB_FILE, JSON.stringify({
+      vehicules:[], chauffeurs:[], affectations:[],
+      versements:[], depenses:[], alertes:[], activites:[],
+      facturations:[], tags:[], proprietaires:[], gestionnaires:[],
+      gps_config:{}, gps_trajets:[], gps_km_journaliers:[], rappels_custom:[]
+    }, null, 2));
+  }
+  const db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+  // Normaliser les tags (s'assurer qu'ils sont tous des strings)
+  if(db.tags) db.tags = normalizeTags(db.tags);
+  ['activites','facturations','tags','proprietaires','versements',
+   'depenses','alertes','gestionnaires','historique','journal'].forEach(k=>{ if(!db[k]) db[k]=[]; });
+  return db;
+}
+
+function saveDB(db) {
+  const dir = path.dirname(DB_FILE);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(DB_FILE, JSON.stringify(db));
+}
+
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2,6);
+const today = () => new Date().toISOString().split('T')[0];
+
+function getRole(req) {
+  const parsed = url.parse(req.url, true);
+  const token = parsed.query.token || req.headers['x-token'] || '';
+  if (token === MANAGER_PASSWORD) return { role:'manager' };
+  const db = loadDB();
+  const proprio = db.proprietaires.find(p => p.password === token);
+  if (proprio) return { role:'proprietaire', proprio };
+  const gest = db.gestionnaires.find(g => g.password === token);
+  if (gest) return { role:'gestionnaire', gest };
+  return { role:'public' };
+}
+
+function cors(res) {
+  res.setHeader('Content-Type','application/json');
+  res.setHeader('Access-Control-Allow-Origin','*');
+  res.setHeader('Access-Control-Allow-Methods','GET,POST,PATCH,DELETE,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers','Content-Type,X-Token');
+}
+
+// Véhicules visibles selon rôle
+function vehsVisibles(db, auth) {
+  if (auth.role === 'manager') return db.vehicules;
+  if (auth.role === 'proprietaire') return db.vehicules.filter(v => auth.proprio.vehicules_ids.includes(v.id));
+  if (auth.role === 'gestionnaire') {
+    const gTags = auth.gest.tags || (auth.gest.tag ? [auth.gest.tag] : []);
+    // Si le gestionnaire a des tags, inclure aussi les véhicules de ces tags
+    if (gTags.length) {
+      const byTag = db.vehicules.filter(v => gTags.includes(v.tag));
+      const byId  = db.vehicules.filter(v => auth.gest.vehicules_ids.includes(v.id));
+      const allIds = new Set([...byTag.map(v=>v.id), ...byId.map(v=>v.id)]);
+      return db.vehicules.filter(v => allIds.has(v.id));
+    }
+    return db.vehicules.filter(v => auth.gest.vehicules_ids.includes(v.id));
+  }
+  return [];
+}
+
+async function handleAPI(req, res, body) {
+  const db = loadDB();
+  const parsed = url.parse(req.url, true);
+  const p = parsed.pathname;
+  const method = req.method;
+  const q = parsed.query;
+  const auth = getRole(req);
+  cors(res);
+  if (method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+  let data = {};
+  try { data = body ? JSON.parse(body) : {}; } catch(e) {}
+
+  const isManager = auth.role === 'manager';
+  const isGest = auth.role === 'gestionnaire';
+  const isProprio = auth.role === 'proprietaire';
+  const canWrite = isManager || isGest;
+
+  // ── AUTH ──────────────────────────────────────────────────
+  if (p === '/api/auth' && method === 'POST') {
+    if (data.password === MANAGER_PASSWORD)
+      return res.end(JSON.stringify({ role:'manager', token:data.password, nom:'Manager' }));
+    const pr = db.proprietaires.find(x => x.password === data.password);
+    if (pr) return res.end(JSON.stringify({ role:'proprietaire', token:data.password, nom:pr.nom, proprio_id:pr.id }));
+    const gt = db.gestionnaires.find(x => x.password === data.password);
+    if (gt) return res.end(JSON.stringify({
+      role:'gestionnaire',
+      token:data.password,
+      nom:gt.nom,
+      gest_id:gt.id,
+      tags:gt.tags||[],
+      tag:gt.tag||'',
+      vehicules_ids:gt.vehicules_ids||[],
+      is_manager: gt.is_manager || false,         // Affiche comme Manager dans l'UI
+      affiche_comme: gt.is_manager ? 'Manager' : 'Gestionnaire'
+    }));
+    res.writeHead(401); return res.end(JSON.stringify({ detail:'Mot de passe incorrect' }));
+  }
+
+  // ── DASHBOARD ─────────────────────────────────────────────
+  if (p === '/api/dashboard' && method === 'GET') {
+    try {
+    let vehs = vehsVisibles(db, auth);
+    // Filtres optionnels
+    if(q.tag) vehs=vehs.filter(v=>v.tag===q.tag);
+    // Filtre multi-tags : ?tags=TNDF,Mmd,SY TRANSPORT
+    if(q.tags) {
+      const tagList = q.tags.split(',').map(t=>t.trim()).filter(Boolean);
+      if(tagList.length) vehs=vehs.filter(v=>tagList.includes(v.tag));
+    }
+    if(q.vehicule_id) vehs=vehs.filter(v=>v.id===q.vehicule_id);
+    const vIds = vehs.map(v => v.id);
+    const affIds = db.affectations.filter(a => vIds.includes(a.vehicule_id)).map(a => a.id);
+    const totalRec = db.versements.filter(v => affIds.includes(v.affectation_id)).reduce((s,v)=>s+v.montant,0);
+    const totalDep = db.depenses.filter(d => vIds.includes(d.vehicule_id)).reduce((s,d)=>s+d.montant,0);
+    const totalFac = db.facturations.filter(f => vIds.includes(f.vehicule_id)).reduce((s,f)=>s+f.montant_facture,0);
+    // Jour de référence = dernier jour de la période, ou aujourd'hui si pas de période
+    const tj = date_fin && date_fin <= today() ? date_fin : today();
+    const stats = {actif:0,panne:0,repos:0,inactif:0,non_saisi:0};
+    // Affectations actives AU JOUR DE RÉFÉRENCE
+    // Règle : affectation active = pas de date_fin (en cours) = chauffeur toujours affecté
+    // Si date_fin existe, l'affectation est terminée → le véhicule n'est plus présumé actif
+    const affActivesIds = new Set(
+      db.affectations
+        .filter(a => !a.date_fin) // Affectations en cours (sans date de fin)
+        .map(a => a.vehicule_id)
+    );
+    const activitesToday = [];
+    vehs.forEach(v => {
+      const act = db.activites.find(a => a.vehicule_id===v.id && a.date===tj);
+      if (act) {
+        stats[act.statut_jour] = (stats[act.statut_jour]||0)+1;
+        activitesToday.push({vehicule_id:v.id, statut_jour:act.statut_jour, date_ref:tj});
+      } else if (affActivesIds.has(v.id)) {
+        stats.actif++;
+        activitesToday.push({vehicule_id:v.id, statut_jour:'actif', presume:true, date_ref:tj});
+      } else {
+        stats.non_saisi++;
+        activitesToday.push({vehicule_id:v.id, statut_jour:'non_saisi', date_ref:tj});
+      }
+    });
+    // Filtre par période si demandé
+    const date_debut = q.date_debut || '';
+    const date_fin = q.date_fin || '';
+    let recPeriode = totalRec, depPeriode = totalDep, facPeriode = totalFac;
+    if (date_debut && date_fin) {
+      recPeriode = db.versements.filter(v=>affIds.includes(v.affectation_id)&&v.date_versement>=date_debut&&v.date_versement<=date_fin).reduce((s,v)=>s+v.montant,0);
+      depPeriode = db.depenses.filter(d=>vIds.includes(d.vehicule_id)&&d.date_depense>=date_debut&&d.date_depense<=date_fin).reduce((s,d)=>s+d.montant,0);
+      facPeriode = db.facturations.filter(f=>vIds.includes(f.vehicule_id)&&f.date>=date_debut&&f.date<=date_fin).reduce((s,f)=>s+f.montant_facture,0);
+    }
+    const alertes = [];
+    vehs.forEach(v => {
+      if (v.km_prochain_vidange && v.km_actuel >= v.km_prochain_vidange*0.95)
+        alertes.push({type:'warn', message:`Vidange due — ${v.immatriculation}`});
+    });
+    // Retard CORRECT : par vehicule puis somme (evite compensation entre vehicules)
+    // Retard dashboard avec imputation FIFO
+    function imputerFIFODash(facsAll,versAll,facsPeriodeIds){
+      const ft=[...facsAll].sort((a,b)=>a.date.localeCompare(b.date));
+      const vt=[...versAll].sort((a,b)=>a.date_versement.localeCompare(b.date_versement));
+      const pool=vt.map(vs=>vs.montant);
+      const imp={};
+      ft.forEach(fac=>{
+        let due=fac.montant_facture||0,impute=0;
+        for(let i=0;i<pool.length&&due>0;i++){const p=Math.min(pool[i],due);impute+=p;pool[i]-=p;due-=p;}
+        imp[fac.id]=impute;
+      });
+      const perSet=new Set(facsPeriodeIds);
+      let facM=0,encI=0;
+      ft.forEach(fac=>{if(perSet.has(fac.id)){facM+=fac.montant_facture||0;encI+=imp[fac.id]||0;}});
+      return Math.max(0,facM-Math.min(encI,facM));
+    }
+    // Retard = dette globale de TOUS les véhicules visibles (cohérent avec page Retards sans filtre)
+    let retardTotal=0;
+    let retardNbVehs=0;
+    vehs.forEach(v=>{
+      const vAffIds=db.affectations.filter(a=>a.vehicule_id===v.id).map(a=>a.id);
+      const facsAll=db.facturations.filter(f=>f.vehicule_id===v.id);
+      const versAll=db.versements.filter(vs=>vAffIds.includes(vs.affectation_id));
+      const totFacGlob=facsAll.reduce((s,f)=>s+(f.montant_facture||0),0);
+      const totVersGlob=versAll.reduce((s,v)=>s+v.montant,0);
+      const ret=Math.max(0,totFacGlob-totVersGlob);
+      if(ret>0){retardTotal+=ret;retardNbVehs++;}
+    });
+    // Cohérence des KPIs :
+    // recettes = versements reçus (encaissé réel)
+    // facture_total = montant facturé (ce qui est dû)
+    // marge = encaissé - dépenses
+    // retard = par véhicule MAX(0, facturé - encaissé)
+    // taux_marge = encaissé / facturé (taux de recouvrement)
+    // Encaissé sur la période = borné au facturé de la période
+    // Un chauffeur peut avoir versé plus que le facturé du mois (règlement dettes antérieures)
+    // mais l'encaissé IMPUTABLE sur ce mois ne peut pas dépasser le facturé du mois
+    const recPeriodeBorne = Math.min(recPeriode, facPeriode);
+    const tauxRecouvrement = facPeriode>0 ? Math.round(recPeriodeBorne/facPeriode*1000)/10 : 0;
+    return res.end(JSON.stringify({
+      kpis:{
+        recettes:recPeriodeBorne,     // Total encaissé (borné au facturé)
+        depenses:depPeriode,
+        marge:facPeriode-depPeriode,  // Marge = Facturé - Dépenses (pas Encaissé - Dépenses)
+        taux_marge:tauxRecouvrement,  // Taux de recouvrement
+        vehicules_total:vehs.length,
+        retard_total:retardTotal,retard_nb_vehs:retardNbVehs,
+        facture_total:facPeriode      // Total facturé
+      },
+      stats_jour:stats, activites_today:activitesToday, alertes:alertes||[], role:auth.role,
+      periode:{date_debut,date_fin,active:!!(date_debut&&date_fin)}
+    }));
+    } catch(dashErr) {
+      console.error('Dashboard error:', dashErr.message);
+      return res.end(JSON.stringify({
+        kpis:{recettes:0,depenses:0,marge:0,taux_marge:0,vehicules_total:0,retard_total:0,facture_total:0},
+        stats_jour:{actif:0,panne:0,repos:0,inactif:0,non_saisi:0},
+        alertes:[],role:auth.role,periode:{active:false}
+      }));
+    }
+  }
+
+  // ── TAGS ──────────────────────────────────────────────────
+  if (p==='/api/tags'&&method==='GET') return res.end(JSON.stringify(normalizeTags(db.tags)));
+  if (p==='/api/tags'&&method==='POST') {
+    if(!isManager){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    // Normaliser: toujours stocker les tags comme strings simples
+    const rawTag = data.tag;
+    const tagStr = typeof rawTag==='object' ? (rawTag.nom||rawTag.name||JSON.stringify(rawTag)) : String(rawTag||'');
+    if(!tagStr.trim()) return res.end(JSON.stringify(normalizeTags(db.tags)));
+    // Si c'est une mise à jour (ancien -> nouveau)
+    if(data.ancien) {
+      const idx = db.tags.findIndex(t => normalizeTag(t) === String(data.ancien));
+      if(idx !== -1) db.tags[idx] = tagStr.trim();
+      else db.tags.push(tagStr.trim());
+    } else {
+      const exists = db.tags.some(t => normalizeTag(t) === tagStr.trim());
+      if(!exists) db.tags.push(tagStr.trim());
+    }
+    // Normaliser tous les tags existants
+    db.tags = normalizeTags(db.tags);
+    saveDB(db);
+    return res.end(JSON.stringify(db.tags));
+  }
+  if (p==='/api/tags'&&method==='DELETE') {
+    if(!isManager){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    const toDelete = String(data.tag||'');
+    db.tags = normalizeTags(db.tags).filter(t => t !== toDelete);
+    saveDB(db);return res.end(JSON.stringify(db.tags));
+  }
+  // PATCH tag (renommer)
+  if (p==='/api/tags'&&method==='PATCH') {
+    if(!isManager){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    const ancien = String(data.ancien||'');
+    const nouveau = String(data.nouveau||'').trim();
+    if(!ancien||!nouveau) return res.end(JSON.stringify({detail:'Ancien et nouveau nom requis'}));
+    // Renommer dans les tags
+    const idx = db.tags.findIndex(t => normalizeTag(t) === ancien);
+    if(idx !== -1) db.tags[idx] = nouveau;
+    // Renommer sur tous les véhicules
+    db.vehicules.forEach(v => { if(normalizeTag(v.tag) === ancien) v.tag = nouveau; });
+    db.tags = normalizeTags(db.tags);
+    saveDB(db);
+    return res.end(JSON.stringify({ message: 'Tag renommé', tags: db.tags }));
+  }
+
+  // ── VEHICULES ─────────────────────────────────────────────
+  if (p==='/api/vehicules'&&method==='GET') {
+    let list = vehsVisibles(db, auth);
+    if(q.q){const sq=q.q.toLowerCase();list=list.filter(v=>(v.immatriculation||'').toLowerCase().includes(sq)||(v.marque||'').toLowerCase().includes(sq)||(v.tag||'').toLowerCase().includes(sq));}
+    if(q.tag) list=list.filter(v=>v.tag===q.tag);
+    if(q.tags){const tl=q.tags.split(',').map(t=>t.trim()).filter(Boolean);if(tl.length)list=list.filter(v=>tl.includes(v.tag));}
+    if(q.statut_jour){const tj2=today();list=list.filter(v=>{const act=db.activites.find(a=>a.vehicule_id===v.id&&a.date===tj2);return (act?act.statut_jour:'non_saisi')===q.statut_jour;});}
+    const tj=today();
+    list=list.map(v=>{
+      const act=db.activites.find(a=>a.vehicule_id===v.id&&a.date===tj);
+      // Présomption: si affectation active et pas de saisie → actif présumé
+      const hasAffActive = db.affectations.some(a=>a.vehicule_id===v.id&&!a.date_fin);
+      const statutJour = act ? act.statut_jour : (hasAffActive ? 'actif' : 'non_saisi');
+      return{...v,statut_jour:statutJour,statut_presume:!act&&hasAffActive,alerte_vidange:!!(v.km_prochain_vidange&&v.km_actuel>=v.km_prochain_vidange*0.95)};
+    });
+    return res.end(JSON.stringify(list));
+  }
+  if (p==='/api/vehicules'&&method==='POST') {
+    if(!isManager&&!isGest){res.writeHead(403);return res.end(JSON.stringify({detail:'Refuse'}));}
+    const immat=(data.immatriculation||'').toUpperCase().trim();
+    if(db.vehicules.find(v=>v.immatriculation===immat)) return res.end(JSON.stringify({detail:immat+' deja enregistre'}));
+    const v={id:uid(),...data,immatriculation:immat,tag:data.tag||''};
+    db.vehicules.push(v);
+    if(data.proprio_id){const pr=db.proprietaires.find(x=>x.id===data.proprio_id);if(pr&&!pr.vehicules_ids.includes(v.id))pr.vehicules_ids.push(v.id);}
+    if(data.gest_id){const gt=db.gestionnaires.find(x=>x.id===data.gest_id);if(gt&&!gt.vehicules_ids.includes(v.id))gt.vehicules_ids.push(v.id);}
+    if(isGest){const gt=db.gestionnaires.find(x=>x.id===auth.gest.id);if(gt&&!gt.vehicules_ids.includes(v.id))gt.vehicules_ids.push(v.id);v.cree_par=auth.gest.id;}
+    db.historique=(db.historique||[]);
+    db.historique.push({id:uid(),type:'vehicule_cree',ref_id:v.id,ref_nom:v.immatriculation,
+      auteur:isGest?auth.gest.nom:'Manager',role:auth.role,date:new Date().toISOString()});
+    saveDB(db);return res.end(JSON.stringify({id:v.id,message:'Vehicule cree'}));
+  }
+  const vM=p.match(/^\/api\/vehicules\/([^/]+)$/);
+  if(vM&&method==='PATCH'){
+    if(!isManager&&!isGest){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    const idx=db.vehicules.findIndex(v=>v.id===vM[1]);
+    if(idx!==-1){
+      db.vehicules[idx]={...db.vehicules[idx],...data};
+      if(data.proprio_id!==undefined){db.proprietaires.forEach(pr=>{pr.vehicules_ids=pr.vehicules_ids.filter(id=>id!==vM[1]);});if(data.proprio_id){const pr=db.proprietaires.find(x=>x.id===data.proprio_id);if(pr)pr.vehicules_ids.push(vM[1]);}}
+      if(data.gest_id!==undefined){db.gestionnaires.forEach(gt=>{gt.vehicules_ids=gt.vehicules_ids.filter(id=>id!==vM[1]);});if(data.gest_id){const gt=db.gestionnaires.find(x=>x.id===data.gest_id);if(gt)gt.vehicules_ids.push(vM[1]);}}
+      saveDB(db);
+    }
+    return res.end(JSON.stringify({message:'Mis à jour'}));
+  }
+  if(vM&&method==='DELETE'){
+    if(!isManager){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    if(db.affectations.find(a=>a.vehicule_id===vM[1]&&!a.date_fin)) return res.end(JSON.stringify({detail:'Impossible : chauffeur affecté'}));
+    db.vehicules=db.vehicules.filter(v=>v.id!==vM[1]);
+    db.proprietaires.forEach(pr=>{pr.vehicules_ids=pr.vehicules_ids.filter(id=>id!==vM[1]);});
+    db.gestionnaires.forEach(gt=>{gt.vehicules_ids=gt.vehicules_ids.filter(id=>id!==vM[1]);});
+    saveDB(db);return res.end(JSON.stringify({message:'Supprimé'}));
+  }
+
+  // ── FICHE VEHICULE ────────────────────────────────────────
+  const vFiche=p.match(/^\/api\/vehicules\/([^/]+)\/fiche$/);
+  if(vFiche&&method==='GET'){
+    const v=db.vehicules.find(x=>x.id===vFiche[1]);
+    if(!v){res.writeHead(404);return res.end(JSON.stringify({detail:'Introuvable'}));}
+    const myVehs=vehsVisibles(db,auth).map(x=>x.id);
+    if(!myVehs.includes(v.id)){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    const affActive=db.affectations.find(a=>a.vehicule_id===v.id&&!a.date_fin);
+    const chauffeur=affActive?db.chauffeurs.find(c=>c.id===affActive.chauffeur_id):null;
+    const affIds=db.affectations.filter(a=>a.vehicule_id===v.id).map(a=>a.id);
+    const versements=db.versements.filter(vs=>affIds.includes(vs.affectation_id));
+    const depenses=db.depenses.filter(d=>d.vehicule_id===v.id);
+    const facturations=db.facturations.filter(f=>f.vehicule_id===v.id);
+    const total_facture=facturations.reduce((s,f)=>s+f.montant_facture,0);
+    const total_verse=versements.reduce((s,vs)=>s+vs.montant,0);
+    const total_depenses=depenses.reduce((s,d)=>s+d.montant,0);
+    const historique=[];
+    for(let i=0;i<30;i++){
+      const d=new Date();d.setDate(d.getDate()-i);
+      const ds=d.toISOString().split('T')[0];
+      const act=db.activites.find(a=>a.vehicule_id===v.id&&a.date===ds);
+      const fac=db.facturations.find(f=>f.vehicule_id===v.id&&f.date===ds);
+      const vers=versements.filter(vs=>vs.date_versement===ds);
+      historique.push({date:ds,statut:act?act.statut_jour:'non_saisi',montant_facture:fac?fac.montant_facture:0,montant_verse:vers.reduce((s,v)=>s+v.montant,0)});
+    }
+    return res.end(JSON.stringify({vehicule:v,chauffeur,affectation:affActive,versements:versements.slice(-20).reverse(),depenses:depenses.slice(-10).reverse(),total_facture,total_verse,total_depenses,recette_nette:total_verse-total_depenses,manquant:Math.max(0,total_facture-total_verse),historique}));
+  }
+
+  // ── ACTIVITES ─────────────────────────────────────────────
+  if(p==='/api/activites'&&method==='POST'){
+    if(!canWrite){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    // Gestionnaire : vérifier que le véhicule lui appartient
+    if(isGest&&!auth.gest.vehicules_ids.includes(data.vehicule_id)){res.writeHead(403);return res.end(JSON.stringify({detail:'Véhicule non assigné'}));}
+    const statut_jour=data.statut_jour||'actif';
+    const existing=db.activites.findIndex(a=>a.vehicule_id===data.vehicule_id&&a.date===today());
+    const entry={id:existing!==-1?db.activites[existing].id:uid(),vehicule_id:data.vehicule_id,date:today(),statut_jour};
+    if(existing!==-1)db.activites[existing]=entry;else db.activites.push(entry);
+    saveDB(db);return res.end(JSON.stringify({message:'Statut enregistré',statut_jour}));
+  }
+  if(p==='/api/activites/stats'&&method==='GET'){
+    const nb=parseInt(q.jours||'30');
+    const depuis=new Date();depuis.setDate(depuis.getDate()-nb);
+    const myVehs=vehsVisibles(db,auth).map(v=>v.id);
+    const stats={actif:0,panne:0,repos:0,inactif:0};
+    const pannesVeh={};
+    db.activites.filter(a=>myVehs.includes(a.vehicule_id)&&new Date(a.date)>=depuis).forEach(a=>{
+      stats[a.statut_jour]=(stats[a.statut_jour]||0)+1;
+      if(a.statut_jour==='panne'){pannesVeh[a.vehicule_id]=(pannesVeh[a.vehicule_id]||0)+1;}
+    });
+    return res.end(JSON.stringify({stats,pannes_par_vehicule:pannesVeh,nb_jours:nb}));
+  }
+
+  // ── CHAUFFEURS ────────────────────────────────────────────
+  if(p==='/api/chauffeurs'&&method==='GET'){
+    const myVehs=vehsVisibles(db,auth).map(v=>v.id);
+    let list=db.chauffeurs.filter(c=>c.statut==='actif');
+    if(isGest){
+      // Gestionnaire voit : chauffeurs affectés à ses véhicules + chauffeurs qu'il a créés
+      const affVeh=db.affectations.filter(a=>myVehs.includes(a.vehicule_id)&&!a.date_fin).map(a=>a.chauffeur_id);
+      const mesChauffeurs=list.filter(c=>c.cree_par===auth.gest.id).map(c=>c.id);
+      const tousIds=[...new Set([...affVeh,...mesChauffeurs])];
+      list=list.filter(c=>tousIds.includes(c.id));
+    } else if(isProprio){
+      const affVeh=db.affectations.filter(a=>myVehs.includes(a.vehicule_id)&&!a.date_fin).map(a=>a.chauffeur_id);
+      list=list.filter(c=>affVeh.includes(c.id));
+    }
+    if(q.q){const sq=q.q.toLowerCase();list=list.filter(c=>(c.prenom||'').toLowerCase().includes(sq)||(c.nom||'').toLowerCase().includes(sq)||(c.telephone||'').includes(sq));}
+    list=list.map(c=>{
+      const aff=db.affectations.find(a=>a.chauffeur_id===c.id&&!a.date_fin);
+      const veh=aff?db.vehicules.find(v=>v.id===aff.vehicule_id):null;
+      return{...c,vehicule_actuel:veh?veh.immatriculation+' · '+veh.marque:null,affectation_active:!!aff};
+    });
+    return res.end(JSON.stringify(list));
+  }
+  if(p==='/api/chauffeurs'&&method==='POST'){
+    if(!isManager&&!isGest){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    if(db.chauffeurs.find(c=>c.telephone===(data.telephone||'').trim())) return res.end(JSON.stringify({detail:'Téléphone déjà enregistré'}));
+    if(data.numero_permis&&db.chauffeurs.find(c=>c.numero_permis===(data.numero_permis||'').trim())) return res.end(JSON.stringify({detail:'Permis déjà enregistré'}));
+    // Gérer les numéros Wave multiples
+    const numerosWave = data.numeros_wave&&data.numeros_wave.length
+      ? data.numeros_wave.map(n=>n.trim()).filter(n=>n)
+      : (data.telephone_wave?[data.telephone_wave.trim()]:[data.telephone||''].map(n=>n.trim()));
+    const c={id:uid(),...data,
+              telephone:(data.telephone||'').trim(),
+              numeros_wave: numerosWave,
+              telephone_wave: numerosWave[0]||'', // Compat
+              statut:'actif',date_embauche:today(),
+              cree_par:isGest?auth.gest.id:'manager'};
+    db.chauffeurs.push(c);
+    // Historique
+    db.historique=(db.historique||[]);
+    db.historique.push({id:uid(),type:'chauffeur_cree',ref_id:c.id,ref_nom:c.prenom+' '+c.nom,
+      auteur:isGest?auth.gest.nom:'Manager',role:auth.role,date:new Date().toISOString()});
+    saveDB(db);return res.end(JSON.stringify({id:c.id,message:'Chauffeur enregistré'}));
+  }
+  const cM=p.match(/^\/api\/chauffeurs\/([^/]+)$/);
+  if(cM&&method==='DELETE'){if(!isManager){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}const idx=db.chauffeurs.findIndex(c=>c.id===cM[1]);if(idx!==-1){db.chauffeurs[idx].statut='depart';saveDB(db);}return res.end(JSON.stringify({message:'Chauffeur marqué comme parti'}));}
+  if(cM&&method==='PATCH'){if(!isManager&&!isGest){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}const idx=db.chauffeurs.findIndex(c=>c.id===cM[1]);if(idx!==-1){if(data.telephone&&data.telephone!==db.chauffeurs[idx].telephone&&db.chauffeurs.find((c,i)=>i!==idx&&c.telephone===data.telephone))return res.end(JSON.stringify({detail:'Téléphone déjà utilisé'}));db.chauffeurs[idx]={...db.chauffeurs[idx],...data};saveDB(db);}return res.end(JSON.stringify({message:'Mis à jour'}));}
+
+  // ── FICHE CHAUFFEUR ───────────────────────────────────────
+  const cFiche=p.match(/^\/api\/chauffeurs\/([^/]+)\/fiche$/);
+  if(cFiche&&method==='GET'){
+    const c=db.chauffeurs.find(x=>x.id===cFiche[1]);
+    if(!c){res.writeHead(404);return res.end(JSON.stringify({detail:'Introuvable'}));}
+    const affActive=db.affectations.find(a=>a.chauffeur_id===c.id&&!a.date_fin);
+    const vehicule=affActive?db.vehicules.find(v=>v.id===affActive.vehicule_id):null;
+    const myVehs=vehsVisibles(db,auth).map(v=>v.id);
+    if(!isManager&&vehicule&&!myVehs.includes(vehicule.id)){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    const affIds=db.affectations.filter(a=>a.chauffeur_id===c.id).map(a=>a.id);
+    const versements=db.versements.filter(vs=>affIds.includes(vs.affectation_id));
+    const depenses=db.depenses.filter(d=>d.chauffeur_id===c.id);
+    const facturations=db.facturations.filter(f=>f.chauffeur_id===c.id);
+    const total_facture=facturations.reduce((s,f)=>s+f.montant_facture,0);
+    const total_verse=versements.reduce((s,vs)=>s+vs.montant,0);
+    const total_depenses=depenses.reduce((s,d)=>s+d.montant,0);
+    return res.end(JSON.stringify({chauffeur:c,vehicule,affectation:affActive,versements:versements.slice(-20).reverse(),total_facture,total_verse,total_depenses,recette_nette:total_verse-total_depenses,manquant:Math.max(0,total_facture-total_verse)}));
+  }
+
+  // ── AFFECTATIONS ──────────────────────────────────────────
+  if(p==='/api/affectations'&&method==='GET'){
+    const myVehs=vehsVisibles(db,auth).map(v=>v.id);
+    let list=db.affectations.filter(a=>!a.date_fin&&myVehs.includes(a.vehicule_id));
+    return res.end(JSON.stringify(list.map(a=>{
+      const v=db.vehicules.find(x=>x.id===a.vehicule_id);
+      const c=db.chauffeurs.find(x=>x.id===a.chauffeur_id);
+      return{...a,vehicule:v?v.immatriculation+' · '+v.marque:'?',chauffeur:c?c.prenom+' '+c.nom:'?'};
+    })));
+  }
+  if(p==='/api/affectations'&&method==='POST'){
+    if(!isManager&&!isGest){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    if(db.affectations.find(a=>a.vehicule_id===data.vehicule_id&&!a.date_fin)) return res.end(JSON.stringify({detail:'Ce véhicule a déjà un chauffeur'}));
+    if(db.affectations.find(a=>a.chauffeur_id===data.chauffeur_id&&!a.date_fin)) return res.end(JSON.stringify({detail:'Ce chauffeur est déjà affecté'}));
+    const a={id:uid(),...data,date_fin:null,cree_par:isGest?auth.gest.id:'manager'};
+    db.affectations.push(a);
+    db.historique=(db.historique||[]);
+    const vehAff=db.vehicules.find(v=>v.id===data.vehicule_id);
+    const chaufAff=db.chauffeurs.find(c=>c.id===data.chauffeur_id);
+    db.historique.push({id:uid(),type:'affectation_creee',ref_id:a.id,
+      ref_nom:(vehAff?vehAff.immatriculation:'?')+' → '+(chaufAff?chaufAff.prenom+' '+chaufAff.nom:'?'),
+      auteur:isGest?auth.gest.nom:'Manager',role:auth.role,date:new Date().toISOString()});
+    saveDB(db);
+    return res.end(JSON.stringify({id:a.id,message:'Affectation créée'}));
+  }
+  const aM=p.match(/^\/api\/affectations\/([^/]+)\/cloturer$/);
+  if(aM&&method==='PATCH'){
+    if(!isManager&&!isGest){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    const idx=db.affectations.findIndex(a=>a.id===aM[1]);
+    if(idx!==-1){
+      // Gestionnaire : vérifier que le véhicule lui appartient
+      if(isGest&&!auth.gest.vehicules_ids.includes(db.affectations[idx].vehicule_id)){
+        res.writeHead(403);return res.end(JSON.stringify({detail:'Véhicule non assigné'}));
+      }
+      db.affectations[idx].date_fin=today();
+      db.historique=(db.historique||[]);
+      const vehCl=db.vehicules.find(v=>v.id===db.affectations[idx].vehicule_id);
+      const chCl=db.chauffeurs.find(c=>c.id===db.affectations[idx].chauffeur_id);
+      db.historique.push({id:uid(),type:'affectation_cloturee',ref_id:aM[1],
+        ref_nom:(vehCl?vehCl.immatriculation:'?')+' ← '+(chCl?chCl.prenom+' '+chCl.nom:'?'),
+        auteur:isGest?auth.gest.nom:'Manager',role:auth.role,date:new Date().toISOString()});
+      saveDB(db);
+    }
+    return res.end(JSON.stringify({message:'Clôturée'}));
+  }
+
+  // ── VERSEMENTS ────────────────────────────────────────────
+  if(p==='/api/versements'&&method==='GET'){
+    let visVehs=vehsVisibles(db,auth);
+    if(q.tag) visVehs=visVehs.filter(v=>v.tag===q.tag);
+    const myVehs=visVehs.map(v=>v.id);
+    const myAffIds=db.affectations.filter(a=>myVehs.includes(a.vehicule_id)).map(a=>a.id);
+    let list=db.versements.filter(v=>myAffIds.includes(v.affectation_id));
+    if(q.date_debut&&q.date_fin) list=list.filter(v=>v.date_versement>=q.date_debut&&v.date_versement<=q.date_fin);
+    // Filtre par vehicule_id : retourne TOUS les versements de ce véhicule sans limite
+    if(q.vehicule_id){
+      const vAffIds=db.affectations.filter(a=>a.vehicule_id===q.vehicule_id&&myVehs.includes(a.vehicule_id)).map(a=>a.id);
+      list=list.filter(v=>vAffIds.includes(v.affectation_id));
+      return res.end(JSON.stringify(list.sort((a,b)=>b.date_versement.localeCompare(a.date_versement)).map(v=>{
+        const aff=db.affectations.find(a=>a.id===v.affectation_id);
+        const c=aff?db.chauffeurs.find(x=>x.id===aff.chauffeur_id):null;
+        const veh=db.vehicules.find(x=>x.id===q.vehicule_id);
+        return{...v,chauffeur:c?c.prenom+' '+c.nom:'?',vehicule:veh?veh.immatriculation:'?',vehicule_id:q.vehicule_id};
+      })));
+    }
+    return res.end(JSON.stringify(list.reverse().map(v=>{
+      const aff=db.affectations.find(a=>a.id===v.affectation_id);
+      const c=aff?db.chauffeurs.find(x=>x.id===aff.chauffeur_id):null;
+      const veh=aff?db.vehicules.find(x=>x.id===aff.vehicule_id):null;
+      return{...v,chauffeur:c?c.prenom+' '+c.nom:'?',vehicule:veh?veh.immatriculation:'?',vehicule_id:veh?veh.id:''};
+    })));
+  }
+  if(p==='/api/versements'&&method==='POST'){
+    if(!canWrite){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    const aff=db.affectations.find(a=>a.id===data.affectation_id);
+    if(!aff) return res.end(JSON.stringify({detail:'Affectation introuvable'}));
+    if(isGest&&!auth.gest.vehicules_ids.includes(aff.vehicule_id)){res.writeHead(403);return res.end(JSON.stringify({detail:'Véhicule non assigné'}));}
+    const attendu=aff.montant_journalier,montant=Number(data.montant);
+    const statut=montant>=attendu?'recu':montant>0?'partiel':'en_retard';
+    const v={id:uid(),...data,montant,montant_attendu:attendu,statut,created_at:new Date().toISOString()};
+    db.versements.push(v);saveDB(db);return res.end(JSON.stringify({id:v.id,statut,ecart:attendu-montant,message:'Versement enregistré'}));
+  }
+  const vsM=p.match(/^\/api\/versements\/([^/]+)$/);
+  // SUPPRIMER un versement
+  const versM=p.match(/^\/api\/versements\/([^/]+)$/);
+  if(versM&&method==='DELETE'){
+    if(!canWrite){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    const vs=db.versements.find(v=>v.id===versM[1]);
+    if(!vs){res.writeHead(404);return res.end(JSON.stringify({detail:'Versement introuvable'}));}
+    const aff=db.affectations.find(a=>a.id===vs.affectation_id);
+    if(isGest&&aff&&!auth.gest.vehicules_ids.includes(aff.vehicule_id)){
+      res.writeHead(403);return res.end(JSON.stringify({detail:'Véhicule non assigné'}));
+    }
+    db.versements=db.versements.filter(v=>v.id!==versM[1]);
+    db.historique=(db.historique||[]);
+    const vehV=aff?db.vehicules.find(x=>x.id===aff.vehicule_id):null;
+    db.historique.push({id:uid(),type:'versement_supprime',
+      ref_nom:(vehV?vehV.immatriculation:'?')+' '+vs.date_versement+' ('+vs.montant+' F)',
+      auteur:isGest?auth.gest.nom:'Manager',role:auth.role,date:new Date().toISOString()});
+    saveDB(db);return res.end(JSON.stringify({message:'Versement supprimé'}));
+  }
+
+  if(vsM&&method==='DELETE'){if(!isManager){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}db.versements=db.versements.filter(v=>v.id!==vsM[1]);saveDB(db);return res.end(JSON.stringify({message:'Supprimé'}));}
+  if(vsM&&method==='PATCH'){if(!canWrite){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}const idx=db.versements.findIndex(v=>v.id===vsM[1]);if(idx!==-1){const at=db.versements[idx].montant_attendu;const m=data.montant!==undefined?Number(data.montant):db.versements[idx].montant;const s=m>=at?'recu':m>0?'partiel':'en_retard';db.versements[idx]={...db.versements[idx],...data,montant:m,statut:s};saveDB(db);}return res.end(JSON.stringify({message:'Mis à jour'}));}
+
+  // ── DEPENSES ──────────────────────────────────────────────
+  if(p==='/api/depenses'&&method==='GET'){
+    const myVehs=vehsVisibles(db,auth).map(v=>v.id);
+    let list=db.depenses.filter(d=>myVehs.includes(d.vehicule_id));
+    if(q.date_debut&&q.date_fin) list=list.filter(d=>d.date_depense>=q.date_debut&&d.date_depense<=q.date_fin);
+    return res.end(JSON.stringify(list.slice(-300).reverse()));
+  }
+  if(p==='/api/depenses'&&method==='POST'){
+    if(!canWrite){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    if(isGest&&!auth.gest.vehicules_ids.includes(data.vehicule_id)){res.writeHead(403);return res.end(JSON.stringify({detail:'Véhicule non assigné'}));}
+    const d={id:uid(),...data,montant:Number(data.montant),justificatif:data.justificatif||null,date_depense:today(),created_at:new Date().toISOString()};
+    db.depenses.push(d);saveDB(db);return res.end(JSON.stringify({id:d.id,message:'Dépense enregistrée'}));
+  }
+  const dM=p.match(/^\/api\/depenses\/([^/]+)$/);
+  if(dM&&method==='DELETE'){
+    if(!canWrite){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    // Gestionnaire : vérifier que la dépense appartient à un de ses véhicules
+    if(isGest){
+      const dep=db.depenses.find(d=>d.id===dM[1]);
+      if(dep&&!auth.gest.vehicules_ids.includes(dep.vehicule_id)){res.writeHead(403);return res.end(JSON.stringify({detail:'Accès refusé'}));}
+    }
+    db.depenses=db.depenses.filter(d=>d.id!==dM[1]);
+    saveDB(db);return res.end(JSON.stringify({message:'Supprimé'}));
+  }
+  if(dM&&method==='PATCH'){if(!canWrite){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}const idx=db.depenses.findIndex(d=>d.id===dM[1]);if(idx!==-1){db.depenses[idx]={...db.depenses[idx],...data};saveDB(db);}return res.end(JSON.stringify({message:'Mis à jour'}));}
+
+  // ── FACTURATIONS ──────────────────────────────────────────
+  if(p==='/api/facturations'&&method==='GET'){
+    let visVehsFac=vehsVisibles(db,auth);
+    if(q.tag) visVehsFac=visVehsFac.filter(v=>v.tag===q.tag);
+    const myVehs=visVehsFac.map(v=>v.id);
+    let list=db.facturations.filter(f=>myVehs.includes(f.vehicule_id));
+    if(q.vehicule_id) list=list.filter(f=>f.vehicule_id===q.vehicule_id);
+    if(q.chauffeur_id) list=list.filter(f=>f.chauffeur_id===q.chauffeur_id);
+    if(q.date_debut&&q.date_fin) list=list.filter(f=>f.date>=q.date_debut&&f.date<=q.date_fin);
+    return res.end(JSON.stringify(list.reverse().map(f=>{
+      const v=db.vehicules.find(x=>x.id===f.vehicule_id);
+      const c=db.chauffeurs.find(x=>x.id===f.chauffeur_id);
+      return{...f,vehicule:v?v.immatriculation:'?',chauffeur:c?c.prenom+' '+c.nom:'?'};
+    })));
+  }
+  if(p==='/api/facturations'&&method==='POST'){
+    if(!canWrite){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    // Gestionnaire : vérifier que le véhicule lui est assigné (via tags ou ids)
+    if(isGest){
+      const myVehs=vehsVisibles(db,auth).map(v=>v.id);
+      if(!myVehs.includes(data.vehicule_id)){res.writeHead(403);return res.end(JSON.stringify({detail:'Véhicule non assigné à votre compte'}));}
+    }
+    const existing=db.facturations.findIndex(f=>f.vehicule_id===data.vehicule_id&&f.date===data.date);
+    if(existing!==-1){
+      // Mise à jour si même véhicule/date (pas un vrai doublon — c'est une correction)
+      db.facturations[existing]={...db.facturations[existing],...data,updated_at:new Date().toISOString()};
+      saveDB(db);
+      return res.end(JSON.stringify({message:'Facturation mise à jour',id:db.facturations[existing].id,updated:true}));
+    }
+    const f={id:uid(),...data,created_at:new Date().toISOString()};
+    db.facturations.push(f);saveDB(db);return res.end(JSON.stringify({id:f.id,message:'Facturation enregistrée',updated:false}));
+  }
+  // MODIFIER une facturation
+  const facM=p.match(/^\/api\/facturations\/([^/]+)$/);
+  if(facM&&method==='PATCH'){
+    if(!canWrite){res.writeHead(403);return res.end(JSON.stringify({detail:'Refus\u00e9'}));}
+    const idx=db.facturations.findIndex(f=>f.id===facM[1]);
+    if(idx===-1){res.writeHead(404);return res.end(JSON.stringify({detail:'Facturation introuvable'}));}
+    if(isGest&&!auth.gest.vehicules_ids.includes(db.facturations[idx].vehicule_id)){res.writeHead(403);return res.end(JSON.stringify({detail:'V\u00e9hicule non assign\u00e9'}));}
+    const old=db.facturations[idx];
+    db.facturations[idx]={...old,...data,updated_at:new Date().toISOString()};
+    db.historique=(db.historique||[]);
+    const vFac=db.vehicules.find(v=>v.id===old.vehicule_id);
+    db.historique.push({id:uid(),type:'facturation_modifiee',
+      ref_nom:(vFac?vFac.immatriculation:'?')+' '+old.date+' : '+old.montant_facture+' F -> '+data.montant_facture+' F',
+      auteur:isGest?auth.gest.nom:'Manager',role:auth.role,date:new Date().toISOString()});
+    saveDB(db);return res.end(JSON.stringify({message:'Facturation modifi\u00e9e'}));
+  }
+  // SUPPRIMER une facturation
+  if(facM&&method==='DELETE'){
+    if(!canWrite){res.writeHead(403);return res.end(JSON.stringify({detail:'Refus\u00e9'}));}
+    const fac=db.facturations.find(f=>f.id===facM[1]);
+    if(!fac){res.writeHead(404);return res.end(JSON.stringify({detail:'Facturation introuvable'}));}
+    if(isGest&&!auth.gest.vehicules_ids.includes(fac.vehicule_id)){res.writeHead(403);return res.end(JSON.stringify({detail:'V\u00e9hicule non assign\u00e9'}));}
+    db.facturations=db.facturations.filter(f=>f.id!==facM[1]);
+    db.historique=(db.historique||[]);
+    const vFacD=db.vehicules.find(v=>v.id===fac.vehicule_id);
+    db.historique.push({id:uid(),type:'facturation_supprimee',
+      ref_nom:(vFacD?vFacD.immatriculation:'?')+' '+fac.date+' ('+fac.montant_facture+' F)',
+      auteur:isGest?auth.gest.nom:'Manager',role:auth.role,date:new Date().toISOString()});
+    saveDB(db);return res.end(JSON.stringify({message:'Facturation supprim\u00e9e'}));
+  }
+  // FACTURATION MULTIPLE
+  if(p==='/api/facturations/multiple'&&method==='POST'){
+    if(!canWrite){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    const {vehicules_ids, type_journee, date} = data;
+    if(!vehicules_ids||!vehicules_ids.length) return res.end(JSON.stringify({detail:'Aucun véhicule sélectionné'}));
+    const results=[];
+    for(const vid of vehicules_ids){
+      if(isGest&&!auth.gest.vehicules_ids.includes(vid)) continue;
+      const aff=db.affectations.find(a=>a.vehicule_id===vid&&!a.date_fin);
+      if(!aff) continue;
+      const montant_base=aff.montant_journalier;
+      const montant_facture=type_journee==='complet'?montant_base:type_journee==='demi_panne'?Math.round(montant_base/2):0;
+      const existing=db.facturations.findIndex(f=>f.vehicule_id===vid&&f.date===date);
+      const fac={id:existing!==-1?db.facturations[existing].id:uid(),vehicule_id:vid,chauffeur_id:aff.chauffeur_id,date,type_journee,montant_facture,montant_base,created_at:new Date().toISOString()};
+      if(existing!==-1)db.facturations[existing]=fac;else db.facturations.push(fac);
+      // Mettre à jour le statut jour
+      const sjMap={complet:'actif',demi_panne:'panne',repos:'repos',inactif:'inactif'};
+      const statut_jour=sjMap[type_journee]||'actif';
+      const eidx=db.activites.findIndex(a=>a.vehicule_id===vid&&a.date===date);
+      const entry={id:eidx!==-1?db.activites[eidx].id:uid(),vehicule_id:vid,date,statut_jour};
+      if(eidx!==-1)db.activites[eidx]=entry;else db.activites.push(entry);
+      results.push({vehicule_id:vid,montant_facture});
+    }
+    saveDB(db);return res.end(JSON.stringify({message:`${results.length} véhicules facturés`,results}));
+  }
+
+  // ── ENCAISSEMENT ──────────────────────────────────────────
+  if(p==='/api/encaissements'&&method==='POST'){
+    if(!canWrite){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    const{chauffeur_id,montant_recu,mode_paiement,date_encaissement,mode_imputation}=data;
+    const aff_active=db.affectations.find(a=>a.chauffeur_id===chauffeur_id&&!a.date_fin);
+    if(!aff_active) return res.end(JSON.stringify({detail:'Aucune affectation active'}));
+    if(isGest&&!auth.gest.vehicules_ids.includes(aff_active.vehicule_id)){res.writeHead(403);return res.end(JSON.stringify({detail:'Véhicule non assigné'}));}
+    const montant=Number(montant_recu);
+    const affIds=db.affectations.filter(a=>a.chauffeur_id===chauffeur_id).map(a=>a.id);
+    const total_verse=db.versements.filter(v=>affIds.includes(v.affectation_id)).reduce((s,v)=>s+v.montant,0);
+    const total_facture=db.facturations.filter(f=>f.chauffeur_id===chauffeur_id).reduce((s,f)=>s+f.montant_facture,0);
+    const dette=Math.max(0,total_facture-total_verse);
+    const statut=montant>=aff_active.montant_journalier?'recu':montant>0?'partiel':montant===0?'repos_panne':'en_retard';
+    const v={id:uid(),affectation_id:aff_active.id,montant,montant_attendu:aff_active.montant_journalier,statut,
+              mode_paiement:mode_paiement||'especes',reference:data.reference||'',
+              date_versement:date_encaissement||today(),created_at:new Date().toISOString()};
+    db.versements.push(v);
+    // Historique encaissement
+    db.historique=(db.historique||[]);
+    const vehEnc=db.vehicules.find(x=>x.id===aff_active.vehicule_id);
+    const chEnc=db.chauffeurs.find(x=>x.id===chauffeur_id);
+    db.historique.push({id:uid(),type:'encaissement',
+      ref_nom:(vehEnc?vehEnc.immatriculation:'?')+' — '+(chEnc?chEnc.prenom+' '+chEnc.nom:'?')+' — '+montant+' F ('+mode_paiement+')',
+      auteur:isGest?auth.gest.nom:'Manager',role:auth.role,date:new Date().toISOString()});
+    saveDB(db);
+    return res.end(JSON.stringify({message:'Encaissement enregistré',versement_id:v.id,dette_avant:dette,dette_apres:Math.max(0,dette-montant)}));
+  }
+
+  // ── RETARDS ───────────────────────────────────────────────
+  if(p==='/api/retards'&&method==='GET'){
+    let vehs=vehsVisibles(db,auth);
+    const date_debut=q.date_debut||'';
+    const date_fin=q.date_fin||'';
+    // Filtre par tag (simple ou multi)
+    if(q.tag) vehs=vehs.filter(v=>v.tag===q.tag);
+    if(q.tags) {
+      const tagList=q.tags.split(',').map(t=>t.trim()).filter(Boolean);
+      if(tagList.length) vehs=vehs.filter(v=>tagList.includes(v.tag));
+    }
+
+    // ── Retard RÉEL = Dette cumulée globale ───────────────────
+    // Retard = Total facturé depuis le début - Total versé depuis le début
+    // La période filtre uniquement les véhicules ACTIFS sur cette période
+    // (ont au moins une facturation dans la période).
+    // Cela évite les faux retards dus au FIFO inter-périodes.
+
+    const retards=vehs.map(v=>{
+      const affs=db.affectations.filter(a=>a.vehicule_id===v.id);
+      const affIds=affs.map(a=>a.id);
+      const aff_active=affs.find(a=>!a.date_fin);
+      const chauffeur=aff_active?db.chauffeurs.find(c=>c.id===aff_active.chauffeur_id):null;
+
+      // Toutes les données du véhicule
+      const facsAll=db.facturations.filter(f=>f.vehicule_id===v.id);
+      const versAll=db.versements.filter(vs=>affIds.includes(vs.affectation_id));
+
+      // Filtre période : ne garder que les véhicules ayant des factures sur la période
+      if(date_debut&&date_fin){
+        const facsPer=facsAll.filter(f=>f.date>=date_debut&&f.date<=date_fin);
+        if(facsPer.length===0) return null;
+      }
+
+      // Dette globale = tout l'historique
+      const totFac=facsAll.reduce((s,f)=>s+(f.montant_facture||0),0);
+      const totVers=versAll.reduce((s,v)=>s+v.montant,0);
+      const retard=Math.max(0,totFac-totVers);
+
+      if(retard===0) return null;
+
+      // Trouver le gestionnaire responsable de ce véhicule (par tag ou par vehicules_ids)
+      const gestResp = db.gestionnaires.find(g => {
+        const gTags = g.tags || (g.tag ? [g.tag] : []);
+        return gTags.includes(v.tag) || (g.vehicules_ids||[]).includes(v.id);
+      });
+
+      return{
+        vehicule_id:v.id,
+        immatriculation:v.immatriculation,
+        marque:v.marque,
+        tag:v.tag||'',
+        chauffeur:chauffeur?chauffeur.prenom+' '+chauffeur.nom:'Non affecté',
+        gestionnaire:gestResp?gestResp.nom:'—',
+        gestionnaire_id:gestResp?gestResp.id:null,
+        total_facture:totFac,
+        total_verse:totVers,
+        retard
+      };
+    }).filter(Boolean).sort((a,b)=>b.retard-a.retard);
+    return res.end(JSON.stringify(retards));
+  }
+  if(p==='/api/rapport'&&method==='GET'){
+    const vehs=vehsVisibles(db,auth);
+    const date_debut=q.date_debut||'';
+    const date_fin=q.date_fin||'';
+    return res.end(JSON.stringify(vehs.map(v=>{
+      const affs=db.affectations.filter(a=>a.vehicule_id===v.id);
+      const affIds=affs.map(a=>a.id);
+      const aff=affs.find(a=>!a.date_fin);
+      const c=aff?db.chauffeurs.find(x=>x.id===aff.chauffeur_id):null;
+      let vers=db.versements.filter(vs=>affIds.includes(vs.affectation_id));
+      let deps=db.depenses.filter(d=>d.vehicule_id===v.id);
+      let facs=db.facturations.filter(f=>f.vehicule_id===v.id);
+      if(date_debut&&date_fin){vers=vers.filter(vs=>vs.date_versement>=date_debut&&vs.date_versement<=date_fin);deps=deps.filter(d=>d.date_depense>=date_debut&&d.date_depense<=date_fin);facs=facs.filter(f=>f.date>=date_debut&&f.date<=date_fin);}
+      return{immatriculation:v.immatriculation,marque:v.marque,tag:v.tag||'',chauffeur:c?c.prenom+' '+c.nom:'Non affecté',recettes:vers.reduce((s,vs)=>s+vs.montant,0),depenses:deps.reduce((s,d)=>s+d.montant,0),facture:facs.reduce((s,f)=>s+f.montant_facture,0)};
+    })));
+  }
+
+  // ── ALERTES ───────────────────────────────────────────────
+  if(p==='/api/alertes'&&method==='GET') return res.end(JSON.stringify(db.alertes.slice(-50).reverse()));
+  if(p==='/api/alertes'&&method==='POST'){
+    const al={id:uid(),...data,message:data.message||'SyNdongo — Alerte',statut:'simule',created_at:new Date().toISOString()};
+    db.alertes.push(al);saveDB(db);return res.end(JSON.stringify({id:al.id,statut:'simule'}));
+  }
+
+  // ── GESTIONNAIRES ─────────────────────────────────────────
+  if(p==='/api/gestionnaires'&&method==='GET'){
+    if(!isManager&&!isGest){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    if(isGest){
+      // Un gestionnaire ne voit que sa propre fiche (avec clé Wave masquée)
+      const g=db.gestionnaires.find(x=>x.id===auth.gest.id);
+      if(!g) return res.end(JSON.stringify([]));
+      const safe={...g, wave_api_key: g.wave_api_key?'***CONFIGUREE***':''};
+      return res.end(JSON.stringify([safe]));
+    }
+    // Manager voit tout mais masque les clés Wave
+    const list=db.gestionnaires.map(g=>({...g,wave_api_key:g.wave_api_key?'***CONFIGUREE***':''}));
+    return res.end(JSON.stringify(list));
+  }
+  if(p==='/api/gestionnaires'&&method==='POST'){
+    if(!isManager){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    if(db.gestionnaires.find(g=>g.password===data.password)) return res.end(JSON.stringify({detail:'Ce mot de passe est déjà utilisé'}));
+    const g={id:uid(),nom:data.nom,telephone:data.telephone||'',email:data.email||'',password:data.password||uid().slice(0,8),vehicules_ids:data.vehicules_ids||[],tag:data.tag||'',proprio_id:data.proprio_id||null};
+    db.gestionnaires.push(g);saveDB(db);return res.end(JSON.stringify({id:g.id,password:g.password,message:'Gestionnaire créé'}));
+  }
+  const gM=p.match(/^\/api\/gestionnaires\/([^/]+)$/);
+  if(gM&&method==='PATCH'){
+    // Manager peut tout modifier. Gestionnaire peut modifier sa PROPRE clé Wave uniquement.
+    if(!isManager&&!(isGest&&auth.gest.id===gM[1])){
+      res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));
+    }
+    const idx=db.gestionnaires.findIndex(g=>g.id===gM[1]);
+    if(idx!==-1){
+      if(isGest&&!isManager){
+        // Gestionnaire : ne peut modifier que sa clé Wave et ses infos personnelles
+        const allowed={wave_api_key:data.wave_api_key,nom:data.nom,telephone:data.telephone,email:data.email};
+        Object.keys(allowed).forEach(k=>{if(allowed[k]!==undefined)db.gestionnaires[idx][k]=allowed[k];});
+      } else {
+        db.gestionnaires[idx]={...db.gestionnaires[idx],...data};
+      }
+      saveDB(db);
+    }
+    return res.end(JSON.stringify({message:'Mis à jour'}));
+  }
+  if(gM&&method==='DELETE'){
+    if(!isManager){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    db.gestionnaires=db.gestionnaires.filter(g=>g.id!==gM[1]);saveDB(db);
+    return res.end(JSON.stringify({message:'Supprimé'}));
+  }
+
+  // ── PROPRIETAIRES ─────────────────────────────────────────
+  // Manager : voit tous les propriétaires
+  // Gestionnaire : voit seulement les propriétaires de ses véhicules
+  if(p==='/api/proprietaires'&&method==='GET'){
+    if(!isManager&&!isGest){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    if(isGest){
+      // Filtrer : seulement les propriétaires qui ont au moins 1 véhicule du gestionnaire
+      const myVehIds=auth.gest.vehicules_ids||[];
+      const myProps=db.proprietaires.filter(pr=>pr.vehicules_ids.some(vid=>myVehIds.includes(vid)));
+      return res.end(JSON.stringify(myProps));
+    }
+    return res.end(JSON.stringify(db.proprietaires));
+  }
+  if(p==='/api/proprietaires'&&method==='POST'){
+    if(!isManager&&!isGest){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    if(db.proprietaires.find(pr=>pr.password===data.password)) return res.end(JSON.stringify({detail:'Ce mot de passe est déjà utilisé'}));
+    // Gestionnaire : ne peut créer un proprio que pour ses propres véhicules
+    let vehicules_ids = data.vehicules_ids||[];
+    if(isGest){
+      const myVehIds=auth.gest.vehicules_ids||[];
+      vehicules_ids=vehicules_ids.filter(vid=>myVehIds.includes(vid));
+      if(!vehicules_ids.length) vehicules_ids=[];
+    }
+    const pr={id:uid(),nom:data.nom,email:data.email||'',telephone:data.telephone||'',
+               password:data.password||uid().slice(0,8),vehicules_ids,
+               cree_par:isGest?auth.gest.id:'manager'};
+    db.proprietaires.push(pr);saveDB(db);
+    return res.end(JSON.stringify({id:pr.id,password:pr.password,message:'Propriétaire créé'}));
+  }
+  const prM=p.match(/^\/api\/proprietaires\/([^/]+)$/);
+  if(prM&&method==='PATCH'){
+    if(!isManager&&!isGest){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    const idx=db.proprietaires.findIndex(pr=>pr.id===prM[1]);
+    if(idx!==-1){
+      // Gestionnaire : ne peut modifier que les propriétaires liés à ses véhicules
+      if(isGest){
+        const myVehIds=auth.gest.vehicules_ids||[];
+        const prVehs=db.proprietaires[idx].vehicules_ids||[];
+        if(!prVehs.some(vid=>myVehIds.includes(vid))){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+        // Filtrer les vehicules_ids dans la mise à jour
+        if(data.vehicules_ids) data.vehicules_ids=data.vehicules_ids.filter(vid=>myVehIds.includes(vid));
+      }
+      db.proprietaires[idx]={...db.proprietaires[idx],...data};saveDB(db);
+    }
+    return res.end(JSON.stringify({message:'Mis à jour'}));
+  }
+  if(prM&&method==='DELETE'){
+    if(!isManager&&!isGest){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    if(isGest){
+      // Gestionnaire : ne peut supprimer que les propriétaires qu'il a créés
+      const pr=db.proprietaires.find(pr=>pr.id===prM[1]);
+      if(!pr||pr.cree_par!==auth.gest.id){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé — vous ne pouvez supprimer que les accès que vous avez créés'}));}
+    }
+    db.proprietaires=db.proprietaires.filter(pr=>pr.id!==prM[1]);saveDB(db);
+    return res.end(JSON.stringify({message:'Supprimé'}));
+  }
+
+  // ── FACTURATION AUTOMATIQUE PAR STATUT ───────────────────────
+  // Appelée quand on change le statut journalier d'un véhicule
+  // Actif → facture = montant_journalier (lendemain seulement)
+  // Panne ou Repos ou Inactif → facture = 0 pour ce jour
+  if(p==='/api/activites/auto_facture'&&method==='POST'){
+    if(!canWrite){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    const {vehicule_id, statut_jour, date} = data;
+    const targetDate = date || today();
+    
+    // Trouver l'affectation active
+    const aff = db.affectations.find(a=>a.vehicule_id===vehicule_id&&!a.date_fin);
+    if(!aff) return res.end(JSON.stringify({message:'Aucune affectation — facturation ignorée'}));
+    
+    // Calculer le montant selon le statut
+    let montant_facture = 0;
+    let type_journee = 'repos';
+    if(statut_jour==='actif'){
+      montant_facture = aff.montant_journalier;
+      type_journee = 'complet';
+    } else if(statut_jour==='panne'){
+      montant_facture = 0; // panne = rien à payer
+      type_journee = 'demi_panne';
+    } else if(statut_jour==='repos'||statut_jour==='inactif'){
+      montant_facture = 0;
+      type_journee = statut_jour==='inactif'?'inactif':'repos';
+    }
+    
+    // Créer ou mettre à jour la facturation pour ce jour
+    const existIdx = db.facturations.findIndex(f=>f.vehicule_id===vehicule_id&&f.date===targetDate);
+    const fac = {
+      id: existIdx!==-1?db.facturations[existIdx].id:uid(),
+      vehicule_id, chauffeur_id:aff.chauffeur_id, date:targetDate,
+      type_journee, montant_facture, montant_base:aff.montant_journalier,
+      auto:true, created_at:new Date().toISOString()
+    };
+    if(existIdx!==-1) db.facturations[existIdx]=fac;
+    else db.facturations.push(fac);
+    
+    // Historique
+    const veh=db.vehicules.find(v=>v.id===vehicule_id);
+    db.historique=(db.historique||[]);
+    db.historique.push({id:uid(),type:'auto_facturation',
+      ref_nom:(veh?veh.immatriculation:'?')+' → '+type_journee+' → '+montant_facture+' F',
+      auteur:isGest?auth.gest.nom:'Manager',role:auth.role,date:new Date().toISOString()});
+    
+    saveDB(db);
+    return res.end(JSON.stringify({message:'Facturation automatique créée',montant_facture,type_journee}));
+  }
+
+  // ── WAVE API OFFICIELLE ───────────────────────────────────────
+
+  // Créer une session de paiement Wave (paiement manuel déclenché par l'agent)
+  if(p==='/api/wave/checkout'&&method==='POST'){
+    if(!canWrite){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    const {chauffeur_id, montant} = data;
+    const chauffeur=db.chauffeurs.find(c=>c.id===chauffeur_id);
+    if(!chauffeur) return res.end(JSON.stringify({detail:'Chauffeur introuvable'}));
+    // Clé Wave : celle du gestionnaire en priorité, sinon celle du manager
+    const waveKey = isGest ? (auth.gest.wave_api_key||WAVE_API_KEY) : WAVE_API_KEY;
+    if(!waveKey) return res.end(JSON.stringify({detail:'Clé Wave non configurée. Ajoutez votre clé dans Accès & Partage → Configuration Wave.'}));
+    const reference='SND-'+uid().toUpperCase();
+    const result = await createWavePayment(
+      Number(montant),
+      chauffeur.telephone,
+      'SyNdongo — '+chauffeur.prenom+' '+chauffeur.nom,
+      reference,
+      waveKey
+    );
+    if(result.error) return res.end(JSON.stringify({detail:'Erreur Wave: '+result.error}));
+    // Sauvegarder la référence en attente
+    db.wave_pending=(db.wave_pending||{});
+    db.wave_pending[reference]={chauffeur_id,montant:Number(montant),created_at:new Date().toISOString()};
+    saveDB(db);
+    return res.end(JSON.stringify({
+      checkout_url: result.wave_launch_url || result.checkout_status?.checkout_url || '',
+      reference,
+      message:'Session Wave créée'
+    }));
+  }
+
+  // Webhook Wave officiel — reçoit les événements de paiement
+  if(p==='/api/webhook/wave'&&method==='POST'){
+    // Vérifier signature
+    const sig=req.headers['wave-signature']||'';
+    if(!verifyWaveSignature(body,sig)&&WAVE_WEBHOOK_SECRET){
+      res.writeHead(401);return res.end(JSON.stringify({status:'invalid_signature'}));
+    }
+    // Format Wave: { type, data: { checkout_session: { client_reference, amount, payment_status } } }
+    const event=data;
+    const session=event?.data?.checkout_session||event;
+    const reference=session.client_reference||session.reference||'';
+    const amount=Number(session.amount||session.net_amount||0);
+    const payment_status=session.payment_status||event.type||'';
+    
+    if(payment_status!=='succeeded'&&payment_status!=='checkout.session.completed'&&event.type!=='checkout.session.completed'){
+      return res.end(JSON.stringify({status:'ignored',payment_status}));
+    }
+    
+    // Trouver le chauffeur via la référence ou le téléphone
+    let chauffeur=null,affectation=null;
+    const pending=db.wave_pending&&db.wave_pending[reference];
+    if(pending){
+      // Identification par référence SyNdongo (la plus fiable)
+      chauffeur=db.chauffeurs.find(c=>c.id===pending.chauffeur_id);
+      affectation=db.affectations.find(a=>a.chauffeur_id===pending.chauffeur_id&&!a.date_fin);
+    } else {
+      // Fallback: chercher par numéro Wave pré-enregistré (priorité) puis téléphone
+      const phone=(session.client_phone||session.mobile||session.payer_mobile||'').replace(/\D/g,'');
+      if(phone){
+        // 1. Chercher dans TOUS les numéros Wave enregistrés
+        chauffeur=db.chauffeurs.find(c=>{
+          const nums=c.numeros_wave&&c.numeros_wave.length?c.numeros_wave:[c.telephone_wave||'',c.telephone||''];
+          return nums.some(n=>n&&n.replace(/\D/g,'').slice(-8)===phone.slice(-8));
+        });
+        // 2. Fallback numéro téléphone principal
+        if(!chauffeur) chauffeur=db.chauffeurs.find(c=>c.telephone&&c.telephone.replace(/\D/g,'').slice(-8)===phone.slice(-8));
+        if(chauffeur) affectation=db.affectations.find(a=>a.chauffeur_id===chauffeur.id&&!a.date_fin);
+      }
+    }
+    
+    // Logger la transaction pour audit même si non trouvé
+    db.historique=(db.historique||[]);
+    const txRef=session.transaction_id||session.id||reference||uid();
+    
+    if(!chauffeur||!affectation){
+      console.log('Wave webhook: chauffeur/affectation introuvable, ref:', reference);
+      return res.end(JSON.stringify({status:'not_found',reference}));
+    }
+    
+    const montant=amount||pending?.montant||0;
+    const statut=montant>=affectation.montant_journalier?'recu':montant>0?'partiel':'en_retard';
+    const v={id:uid(),affectation_id:affectation.id,montant,montant_attendu:affectation.montant_journalier,
+             statut,mode_paiement:'wave',reference:reference,
+             date_versement:today(),created_at:new Date().toISOString(),source:'wave_auto'};
+    db.versements.push(v);
+    // Supprimer de wave_pending
+    if(db.wave_pending&&db.wave_pending[reference]) delete db.wave_pending[reference];
+    db.historique=(db.historique||[]);
+    const vehW=db.vehicules.find(x=>x.id===affectation.vehicule_id);
+    db.historique.push({id:uid(),type:'wave_auto',
+      ref_nom:(vehW?vehW.immatriculation:'?')+' — '+chauffeur.prenom+' '+chauffeur.nom+' — '+montant+' F Wave (auto)',
+      auteur:'Wave API',role:'system',date:new Date().toISOString()});
+    saveDB(db);
+    console.log('[Wave AUTO]', chauffeur.prenom, chauffeur.nom, montant, 'F', reference);
+    res.writeHead(200);return res.end(JSON.stringify({status:'ok',montant,chauffeur:chauffeur.prenom+' '+chauffeur.nom}));
+  }
+
+  // Page de succès Wave (redirection après paiement)
+  if(p==='/api/wave/success'&&method==='GET'){
+    res.setHeader('Content-Type','text/html; charset=utf-8');
+    return res.end(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Paiement réussi</title><style>body{font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;background:#f5f4f0;margin:0}.box{background:#fff;border-radius:16px;padding:32px;text-align:center;max-width:380px;border:2px solid #3B6D11}.icon{font-size:48px}.title{font-size:20px;font-weight:700;color:#3B6D11;margin:12px 0}.sub{color:#6b6b67;font-size:14px}</style></head><body><div class="box"><div class="icon">✅</div><div class="title">Paiement Wave reçu !</div><div class="sub">Votre versement a été enregistré automatiquement dans SyNdongo.</div></div></body></html>`);
+  }
+  if(p==='/api/wave/error'&&method==='GET'){
+    res.setHeader('Content-Type','text/html; charset=utf-8');
+    return res.end(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Erreur paiement</title><style>body{font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;background:#f5f4f0;margin:0}.box{background:#fff;border-radius:16px;padding:32px;text-align:center;max-width:380px;border:2px solid #A32D2D}.icon{font-size:48px}.title{font-size:20px;font-weight:700;color:#A32D2D;margin:12px 0}.sub{color:#6b6b67;font-size:14px}</style></head><body><div class="box"><div class="icon">❌</div><div class="title">Paiement annulé</div><div class="sub">Le paiement Wave n'a pas abouti. Veuillez réessayer.</div></div></body></html>`);
+  }
+
+  // Statut des paiements Wave en attente
+  // Le gestionnaire peut voir ses propres paiements en attente
+  if(p==='/api/wave/pending'&&method==='GET'){
+    if(!isManager&&!isGest){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    const pending=db.wave_pending||{};
+    const list=Object.entries(pending).map(([ref,p])=>{
+      const c=db.chauffeurs.find(x=>x.id===p.chauffeur_id);
+      return{reference:ref,chauffeur:c?c.prenom+' '+c.nom:'?',montant:p.montant,created_at:p.created_at};
+    });
+    return res.end(JSON.stringify(list));
+  }
+
+  // ── JOURNAL DE BORD ──────────────────────────────────────────
+  // ── RAPPELS PERSONNALISÉS ─────────────────────────────────
+  if(p==='/api/rappels_custom'&&method==='GET'){
+    // Filtrer par véhicules visibles (gestionnaire ne voit que ses véhicules)
+    const myVehIds = vehsVisibles(db,auth).map(v=>v.id);
+    const rcVisible = (db.rappels_custom||[]).filter(r=>
+      !r.vehicule_id || myVehIds.includes(r.vehicule_id)
+    );
+    return res.end(JSON.stringify(rcVisible));
+  }
+  if(p==='/api/rappels_custom'&&method==='POST'){
+    if(!isManager){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    const rc={id:uid(),...data,created_at:new Date().toISOString()};
+    if(!db.rappels_custom) db.rappels_custom=[];
+    db.rappels_custom.push(rc);
+    saveDB(db);
+    return res.end(JSON.stringify({message:'Rappel créé',id:rc.id}));
+  }
+  const rcM=p.match(/^\/api\/rappels_custom\/([^/]+)$/);
+  if(rcM&&method==='DELETE'){
+    if(!isManager){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    db.rappels_custom=(db.rappels_custom||[]).filter(r=>r.id!==rcM[1]);
+    saveDB(db);
+    return res.end(JSON.stringify({message:'Supprimé'}));
+  }
+  if(rcM&&method==='PATCH'){
+    if(!isManager){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    const idx=( db.rappels_custom||[]).findIndex(r=>r.id===rcM[1]);
+    if(idx!==-1){db.rappels_custom[idx]={...db.rappels_custom[idx],...data};saveDB(db);}
+    return res.end(JSON.stringify({message:'Mis à jour'}));
+  }
+
+  if(p==='/api/journal'&&method==='GET'){
+    const myVehs=vehsVisibles(db,auth).map(v=>v.id);
+    let list=db.journal||[];
+    // Filtrer par véhicules visibles
+    list=list.filter(j=>myVehs.includes(j.vehicule_id));
+    if(q.vehicule_id) list=list.filter(j=>j.vehicule_id===q.vehicule_id);
+    if(q.categorie) list=list.filter(j=>j.categorie===q.categorie);
+    if(q.date_debut) list=list.filter(j=>j.date>=q.date_debut);
+    if(q.date_fin) list=list.filter(j=>j.date<=q.date_fin);
+    // Enrichir avec immat
+    list=list.slice(-200).reverse().map(j=>{
+      const v=db.vehicules.find(x=>x.id===j.vehicule_id);
+      return{...j,vehicule:v?v.immatriculation+' · '+v.marque:'Tous véhicules'};
+    });
+    return res.end(JSON.stringify(list));
+  }
+  if(p==='/api/journal'&&method==='POST'){
+    if(!isManager&&!isGest){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé — lecture seule'}));}
+    if(isGest&&!auth.gest.vehicules_ids.includes(data.vehicule_id)){
+      res.writeHead(403);return res.end(JSON.stringify({detail:'Véhicule non assigné'}));
+    }
+    if(!db.journal) db.journal=[];
+    const j={id:uid(),vehicule_id:data.vehicule_id,
+              note:data.note||data.texte||'',
+              categorie:data.categorie||data.type||'info',
+              date:data.date||today(),
+              auteur:isGest?auth.gest.nom:'Manager',role:auth.role,
+              created_at:new Date().toISOString()};
+    db.journal.push(j);saveDB(db);
+    return res.end(JSON.stringify({id:j.id,message:'Note publiée'}));
+  }
+  const jM=p.match(/^\/api\/journal\/([^/]+)$/);
+  if(jM&&method==='DELETE'){
+    if(!isManager&&!isGest){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    if(!db.journal) db.journal=[];
+    const j=db.journal.find(x=>x.id===jM[1]);
+    if(j&&isGest&&j.auteur!==auth.gest.nom){res.writeHead(403);return res.end(JSON.stringify({detail:'Vous ne pouvez supprimer que vos propres notes'}));}
+    db.journal=db.journal.filter(x=>x.id!==jM[1]);saveDB(db);
+    return res.end(JSON.stringify({message:'Note supprimée'}));
+  }
+
+  // ── HISTORIQUE ────────────────────────────────────────────
+  if(p==='/api/historique'&&method==='GET'){
+    if(!isManager&&!isGest){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    let list=db.historique||[];
+    // Gestionnaire voit seulement son historique
+    if(isGest) list=list.filter(h=>h.auteur===auth.gest.nom||h.role==='gestionnaire');
+    if(q.limit) list=list.slice(-parseInt(q.limit));
+    return res.end(JSON.stringify(list.slice(-100).reverse()));
+  }
+
+
+  // ═══════════════════════════════════════════════════════════════════
+  // MODULE GPS — Configuration, km journaliers, trajets, facturation auto
+  // ═══════════════════════════════════════════════════════════════════
+
+  // GET /api/gps/config — lire la config Ezzloc (token, règles facturation)
+  if(p==='/api/gps/config'&&method==='GET'){
+    if(!isManager&&!isGest){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    const cfg = db.gps_config || {};
+    // Masquer le token dans la réponse sauf les 20 premiers chars
+    const safe = {...cfg};
+    if(safe.token) safe.token = safe.token.substring(0,20)+'...';
+    return res.end(JSON.stringify(safe));
+  }
+
+  // POST /api/gps/config — sauvegarder la config Ezzloc
+  if(p==='/api/gps/config'&&method==='POST'){
+    if(!isManager){res.writeHead(403);return res.end(JSON.stringify({detail:'Réservé au Manager'}));}
+    db.gps_config = {...(db.gps_config||{}), ...data, updated_at: new Date().toISOString()};
+    saveDB(db);
+    return res.end(JSON.stringify({ok:true}));
+  }
+
+  // GET /api/gps/km — km journaliers par véhicule
+  if(p==='/api/gps/km'&&method==='GET'){
+    if(!isManager&&!isGest){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    let list = db.gps_km_journaliers || [];
+    const vehs = vehsVisibles(db, auth).map(v=>v.id);
+    list = list.filter(k => vehs.includes(k.vehicule_id));
+    if(q.vehicule_id) list = list.filter(k=>k.vehicule_id===q.vehicule_id);
+    if(q.date) list = list.filter(k=>k.date===q.date);
+    if(q.date_debut) list = list.filter(k=>k.date>=q.date_debut);
+    if(q.date_fin) list = list.filter(k=>k.date<=q.date_fin);
+    return res.end(JSON.stringify(list));
+  }
+
+  // POST /api/gps/km — enregistrer km journaliers (manuel ou depuis Ezzloc)
+  if(p==='/api/gps/km'&&method==='POST'){
+    if(!isManager&&!isGest){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    const { vehicule_id, date, km_debut, km_fin, km_parcourus, heures_travail, source } = data;
+    if(!vehicule_id||!date) return res.end(JSON.stringify({detail:'vehicule_id et date requis'}));
+    // Vérifier si entrée existe déjà pour ce véhicule/date
+    const existing = (db.gps_km_journaliers||[]).findIndex(k=>k.vehicule_id===vehicule_id&&k.date===date);
+    const entry = {
+      id: existing>=0 ? db.gps_km_journaliers[existing].id : uid(),
+      vehicule_id, date,
+      km_debut: km_debut||0,
+      km_fin: km_fin||0,
+      km_parcourus: km_parcourus || Math.max(0,(km_fin||0)-(km_debut||0)),
+      heures_travail: heures_travail||0,
+      source: source||'manuel',
+      // Données tableau de bord véhicule (depuis Ezzloc)
+      vitesse_max: data.vitesse_max||0,
+      vitesse_moy: data.vitesse_moy||0,
+      carburant: data.carburant!==undefined ? data.carburant : null,
+      moteur_allume: data.moteur_allume!==undefined ? data.moteur_allume : null,
+      signal: data.signal||'Bon',
+      derniere_position: data.derniere_position||'',
+      latitude: data.latitude||null,
+      longitude: data.longitude||null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+    if(!db.gps_km_journaliers) db.gps_km_journaliers = [];
+    if(existing>=0) db.gps_km_journaliers[existing] = entry;
+    else db.gps_km_journaliers.push(entry);
+
+    // ── Facturation automatique ──────────────────────────────────────
+    const cfg = db.gps_config || {};
+    const seuil_km = cfg.seuil_km_facturation || 30;
+    const seuil_heures = cfg.seuil_heures_facturation || 6;
+    const auto_fac = cfg.facturation_auto !== false; // Activée par défaut
+
+    if(auto_fac && entry.km_parcourus >= seuil_km && entry.heures_travail >= seuil_heures) {
+      // Trouver l'affectation active pour ce véhicule
+      const aff = db.affectations.find(a=>a.vehicule_id===vehicule_id&&!a.date_fin);
+      if(aff) {
+        // Vérifier qu'il n'y a pas déjà une facture pour ce jour
+        const dejaPaye = db.facturations.some(f=>f.vehicule_id===vehicule_id&&f.date===date);
+        if(!dejaPaye) {
+          const fac = {
+            id: uid(),
+            vehicule_id,
+            chauffeur_id: aff.chauffeur_id,
+            affectation_id: aff.id,
+            date,
+            montant_facture: aff.montant_journalier,
+            type_journee: 'journee_complete',
+            source_gps: true,
+            km_gps: entry.km_parcourus,
+            heures_gps: entry.heures_travail,
+            created_at: new Date().toISOString()
+          };
+          db.facturations.push(fac);
+          // Mettre à jour km_actuel du véhicule
+          const veh = db.vehicules.find(v=>v.id===vehicule_id);
+          if(veh && entry.km_fin > 0) veh.km_actuel = entry.km_fin;
+          // Vérifier si vidange nécessaire
+          if(veh && veh.km_prochain_vidange && entry.km_fin >= veh.km_prochain_vidange) {
+            const alerte = { id: uid(), type:'vidange', vehicule_id,
+              message: `Vidange due — ${veh.immatriculation} à ${entry.km_fin} km`,
+              date: date, lu: false, created_at: new Date().toISOString() };
+            if(!db.alertes) db.alertes = [];
+            db.alertes.push(alerte);
+          }
+          saveDB(db);
+          return res.end(JSON.stringify({ok:true, facture_creee:true, montant:aff.montant_journalier}));
+        }
+      }
+    }
+    saveDB(db);
+    return res.end(JSON.stringify({ok:true, facture_creee:false}));
+  }
+
+  // GET /api/gps/live/:vehicule_id — données temps réel (dernière entrée du jour)
+  if(p.startsWith('/api/gps/live/')&&method==='GET'){
+    if(!auth.role||auth.role==='public'){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    const vid = p.split('/').pop();
+    const today = new Date().toISOString().split('T')[0];
+    const entries = (db.gps_km_journaliers||[]).filter(k=>k.vehicule_id===vid&&k.date===today);
+    const last = entries.length ? entries[entries.length-1] : null;
+    const veh = db.vehicules.find(v=>v.id===vid);
+    return res.end(JSON.stringify({
+      vehicule: veh ? {id:veh.id,immatriculation:veh.immatriculation,km_actuel:veh.km_actuel,km_prochain_vidange:veh.km_prochain_vidange} : null,
+      gps_today: last,
+      derniere_maj: last ? last.updated_at||last.created_at : null
+    }));
+  }
+
+  // GET /api/gps/stats — statistiques km par véhicule sur période
+  if(p==='/api/gps/stats'&&method==='GET'){
+    if(!isManager&&!isGest){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    const vehs = vehsVisibles(db, auth);
+    const debut = q.date_debut || '';
+    const fin = q.date_fin || '';
+    let kmList = db.gps_km_journaliers || [];
+    if(debut) kmList = kmList.filter(k=>k.date>=debut);
+    if(fin)   kmList = kmList.filter(k=>k.date<=fin);
+
+    const stats = vehs.map(v=>{
+      const vkm = kmList.filter(k=>k.vehicule_id===v.id);
+      const total_km = vkm.reduce((s,k)=>s+k.km_parcourus,0);
+      const total_h  = vkm.reduce((s,k)=>s+k.heures_travail,0);
+      const jours_actifs = vkm.filter(k=>k.km_parcourus>0).length;
+      const moy_km = jours_actifs ? Math.round(total_km/jours_actifs) : 0;
+      // Alerte vidange
+      const vidange_due = v.km_prochain_vidange && v.km_actuel >= v.km_prochain_vidange;
+      return {
+        vehicule_id:v.id, immatriculation:v.immatriculation, marque:v.marque, tag:v.tag,
+        total_km, total_heures:total_h, jours_actifs, moy_km_jour:moy_km,
+        km_actuel:v.km_actuel||0, km_prochain_vidange:v.km_prochain_vidange||0, vidange_due
+      };
+    });
+    return res.end(JSON.stringify(stats.filter(s=>s.total_km>0||s.km_actuel>0)));
+  }
+
+  // GET /api/gps/trajets — historique trajets (depuis Ezzloc ou manuel)
+  if(p==='/api/gps/trajets'&&method==='GET'){
+    if(!isManager&&!isGest){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    let list = db.gps_trajets || [];
+    const vehs = vehsVisibles(db, auth).map(v=>v.id);
+    list = list.filter(t=>vehs.includes(t.vehicule_id));
+    if(q.vehicule_id) list = list.filter(t=>t.vehicule_id===q.vehicule_id);
+    if(q.date) list = list.filter(t=>t.date===q.date);
+    return res.end(JSON.stringify(list.slice(-200)));
+  }
+
+  // POST /api/gps/trajets — enregistrer un trajet (depuis le proxy Ezzloc)
+  if(p==='/api/gps/trajets'&&method==='POST'){
+    if(!isManager&&!isGest){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    if(!db.gps_trajets) db.gps_trajets = [];
+    const traj = { id: uid(), ...data, created_at: new Date().toISOString() };
+    db.gps_trajets.push(traj);
+    if(db.gps_trajets.length > 5000) db.gps_trajets = db.gps_trajets.slice(-5000);
+    saveDB(db);
+    return res.end(JSON.stringify({ok:true, id:traj.id}));
+  }
+
+  // ── APPLICATION CHAUFFEUR ────────────────────────────────────────────
+
+  // GET /api/chauffeur/photo-checks — voir les checks d'un chauffeur (pour le manager)
+  if(p==='/api/chauffeur/photo-checks'&&method==='GET'){
+    if(!isManager&&!isGest){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    let checks = db.photo_checks||[];
+    if(q.chauffeur_id) checks=checks.filter(c=>c.chauffeur_id===q.chauffeur_id);
+    if(q.vehicule_id)  checks=checks.filter(c=>c.vehicule_id===q.vehicule_id);
+    // Retourner les 50 derniers sans les données base64 (trop lourdes) sauf si demandé
+    const light = checks.slice(-50).reverse().map(c=>({
+      id:c.id, chauffeur_id:c.chauffeur_id, vehicule_id:c.vehicule_id,
+      semaine:c.semaine, gps_timestamp:c.gps_timestamp, created_at:c.created_at,
+      nb_photos: c.photos ? Object.keys(c.photos).length : 0,
+      photos_sides: c.photos ? Object.keys(c.photos) : [],
+      photo_timestamps: c.photos ? Object.fromEntries(
+        Object.entries(c.photos).map(([k,v])=>[k,v.timestamp||''])
+      ) : {}
+    }));
+    return res.end(JSON.stringify(light));
+  }
+
+  // GET /api/chauffeur/dashboard/:chauffeur_id — tableau de bord chauffeur
+  if(p.startsWith('/api/chauffeur/dashboard/')&&method==='GET'){
+    const chId = p.split('/').pop();
+    const ch = db.chauffeurs.find(c=>c.id===chId);
+    if(!ch) {res.writeHead(404);return res.end(JSON.stringify({detail:'Chauffeur introuvable'}));}
+    const aff = db.affectations.find(a=>a.chauffeur_id===chId&&!a.date_fin);
+    const affIds = db.affectations.filter(a=>a.chauffeur_id===chId).map(a=>a.id);
+    const facs = db.facturations.filter(f=>f.chauffeur_id===chId);
+    const vers = db.versements.filter(v=>affIds.includes(v.affectation_id));
+    const totalFac = facs.reduce((s,f)=>s+(f.montant_facture||0),0);
+    const totalVers = vers.reduce((s,v)=>s+v.montant,0);
+    const dette = Math.max(0,totalFac-totalVers);
+    // Ce mois
+    const now = new Date(); const moisDebut = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-01`;
+    const facsMois = facs.filter(f=>f.date>=moisDebut);
+    const versMois = vers.filter(v=>v.date_versement>=moisDebut);
+    const facMoisTotal = facsMois.reduce((s,f)=>s+(f.montant_facture||0),0);
+    const versMoisTotal = versMois.reduce((s,v)=>s+v.montant,0);
+    // Km ce mois
+    const kmMois = (db.gps_km_journaliers||[]).filter(k=>{
+      if(k.date<moisDebut) return false;
+      if(!aff) return false;
+      return k.vehicule_id===aff.vehicule_id;
+    });
+    const totalKmMois = kmMois.reduce((s,k)=>s+k.km_parcourus,0);
+    return res.end(JSON.stringify({
+      chauffeur:{id:ch.id, nom:ch.prenom+' '+ch.nom, telephone:ch.telephone},
+      vehicule:aff?db.vehicules.find(v=>v.id===aff.vehicule_id):null,
+      dette_globale:dette, total_facture:totalFac, total_verse:totalVers,
+      mois:{facture:facMoisTotal, verse:versMoisTotal, km:totalKmMois, nb_jours:facsMois.length},
+      derniers_versements:vers.slice(-5).reverse(),
+      dernieres_factures:facs.slice(-10).reverse()
+    }));
+  }
+
+  // POST /api/chauffeur/photo-check — enregistrer une photo check hebdomadaire
+  if(p==='/api/chauffeur/photo-check'&&method==='POST'){
+    const { chauffeur_id, vehicule_id, semaine, photos, notes } = data;
+    if(!db.photo_checks) db.photo_checks = [];
+    const check = { id:uid(), chauffeur_id, vehicule_id, semaine,
+      photos:photos||[], notes:notes||'', created_at:new Date().toISOString() };
+    db.photo_checks.push(check);
+    if(db.photo_checks.length>500) db.photo_checks=db.photo_checks.slice(-500);
+    saveDB(db);
+    return res.end(JSON.stringify({ok:true, id:check.id}));
+  }
+
+  res.writeHead(404);res.end(JSON.stringify({detail:'Route introuvable'}));
+}
+
+const server=http.createServer((req,res)=>{
+  cors(res);
+  if(req.method==='OPTIONS'){res.writeHead(204);res.end();return;}
+  if(req.url.startsWith('/api/')){let body='';req.on('data',c=>body+=c);req.on('end',()=>handleAPI(req,res,body));return;}
+  if(req.url==='/chauffeur'||req.url.startsWith('/chauffeur')){res.setHeader('Content-Type','text/html; charset=utf-8');res.end(require('fs').readFileSync(require('path').join(__dirname,'chauffeur.html'),'utf8'));return;}
+  if(req.url==='/'||req.url.startsWith('/index')){res.setHeader('Content-Type','text/html; charset=utf-8');res.end(fs.readFileSync(path.join(__dirname,'index.html'),'utf8'));return;}
+  res.writeHead(404);res.end('Not found');
+});
+server.listen(PORT,()=>console.log('\n  SyNdongo v9 — port '+PORT+'\n  DB: '+DB_FILE+'\n'));

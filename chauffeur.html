@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="fr" translate="no">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#185FA5">
+<title>SyNdongo — Espace Chauffeur</title>
+<style>
+* { box-sizing:border-box; margin:0; padding:0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background:#f5f4f0; min-height:100vh; }
+.header { background:#185FA5; color:#fff; padding:16px 20px;
+  display:flex; align-items:center; justify-content:space-between; }
+.header h1 { font-size:18px; font-weight:600; }
+.header .sub { font-size:12px; opacity:.8; margin-top:2px; }
+.card { background:#fff; border-radius:14px; padding:16px; margin:12px 16px;
+  box-shadow:0 1px 4px rgba(0,0,0,.08); }
+.kpi-row { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin:0 16px 0; }
+.kpi { background:#fff; border-radius:12px; padding:14px; text-align:center;
+  box-shadow:0 1px 4px rgba(0,0,0,.08); }
+.kpi .val { font-size:22px; font-weight:700; color:#185FA5; }
+.kpi .lbl { font-size:11px; color:#888; margin-top:3px; }
+.kpi.rouge .val { color:#A32D2D; }
+.kpi.vert .val  { color:#3B6D11; }
+.btn-main { display:block; width:calc(100% - 32px); margin:10px 16px;
+  padding:14px; border-radius:12px; border:none; font-size:15px; font-weight:600;
+  cursor:pointer; text-align:center; }
+.btn-pay { background:#1D9E75; color:#fff; }
+.btn-wave { background:#00B2FF; color:#fff; }
+.btn-om { background:#FF6B00; color:#fff; }
+.btn-photo { background:#185FA5; color:#fff; }
+.section-title { font-size:13px; font-weight:600; color:#444; margin:16px 16px 6px; }
+.fact-item { display:flex; justify-content:space-between; align-items:center;
+  padding:10px 0; border-bottom:1px solid #f0efea; font-size:13px; }
+.fact-item:last-child { border-bottom:none; }
+.badge { font-size:11px; padding:3px 8px; border-radius:6px; font-weight:600; }
+.badge.ok { background:#E1F5EE; color:#0F6E56; }
+.badge.ret { background:#FCEBEB; color:#A32D2D; }
+.badge.part { background:#FAEEDA; color:#854F0B; }
+.login-box { padding:40px 20px; }
+.login-box h2 { font-size:20px; font-weight:700; margin-bottom:8px; color:#185FA5; }
+.login-box p  { font-size:13px; color:#666; margin-bottom:24px; }
+input, select { width:100%; padding:12px 14px; border:1px solid #ddd; border-radius:10px;
+  font-size:15px; margin-bottom:12px; outline:none; }
+input:focus { border-color:#185FA5; }
+.alert-box { background:#FAEEDA; border:1px solid #EF9F27; border-radius:10px;
+  padding:12px; margin:8px 16px; font-size:12px; color:#633806; }
+.loading { text-align:center; padding:40px; color:#888; font-size:14px; }
+.hidden { display:none; }
+.photo-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; padding:8px 0; }
+.photo-btn { aspect-ratio:1; border:2px dashed #ccc; border-radius:10px;
+  display:flex; flex-direction:column; align-items:center; justify-content:center;
+  cursor:pointer; font-size:12px; color:#888; background:#fafafa; }
+.photo-btn.done { border-color:#1D9E75; background:#E1F5EE; color:#0F6E56; }
+.photo-btn .icon { font-size:28px; margin-bottom:4px; }
+</style>
+</head>
+<body>
+
+<!-- LOGIN -->
+<div id="login-view">
+  <div class="header">
+    <div>
+      <h1>🚗 SyNdongo Chauffeur</h1>
+      <div class="sub">Votre espace personnel</div>
+    </div>
+  </div>
+  <div class="login-box">
+    <h2>Connexion</h2>
+    <p>Entrez votre numéro de téléphone pour accéder à votre tableau de bord</p>
+    <input type="tel" id="login-tel" placeholder="Ex: 771234567" inputmode="tel">
+    <button class="btn-main btn-pay" onclick="seConnecter()">Se connecter</button>
+    <div id="login-err" style="color:#A32D2D;font-size:13px;text-align:center;margin-top:8px"></div>
+  </div>
+</div>
+
+<!-- DASHBOARD CHAUFFEUR -->
+<div id="dash-view" class="hidden">
+  <div class="header" id="dash-header">
+    <div>
+      <h1 id="dash-nom">Chargement…</h1>
+      <div class="sub" id="dash-veh">Véhicule : —</div>
+    </div>
+    <button onclick="seDeconnecter()" style="background:none;border:1px solid rgba(255,255,255,.4);
+      color:#fff;padding:6px 12px;border-radius:8px;font-size:12px;cursor:pointer">Déco</button>
+  </div>
+
+  <div style="margin:12px 16px 4px;font-size:12px;color:#888">Ce mois</div>
+  <div class="kpi-row">
+    <div class="kpi rouge"><div class="val" id="kpi-dette">—</div><div class="lbl">Dette totale</div></div>
+    <div class="kpi vert"><div class="val" id="kpi-verse">—</div><div class="lbl">Versé ce mois</div></div>
+    <div class="kpi"><div class="val" id="kpi-fac">—</div><div class="lbl">Facturé ce mois</div></div>
+    <div class="kpi"><div class="val" id="kpi-km">—</div><div class="lbl">Km ce mois</div></div>
+  </div>
+
+  <div id="alerte-vidange" class="alert-box hidden">⚠️ Vidange due — merci de signaler à votre gestionnaire</div>
+  <div id="alerte-retard" class="alert-box hidden" style="background:#FCEBEB;border-color:#E24B4A;color:#791F1F"></div>
+
+  <!-- Payer -->
+  <div class="section-title">💳 Effectuer un versement</div>
+  <button class="btn-main btn-wave" onclick="payerWave()">📱 Payer par Wave</button>
+  <button class="btn-main btn-om" onclick="payerOM()">📱 Payer par Orange Money</button>
+
+  <!-- Check hebdo photos -->
+  <div class="section-title">📷 Check hebdomadaire</div>
+  <div class="card">
+    <div style="font-size:13px;color:#666;margin-bottom:10px">
+      Prenez 4 photos de votre véhicule chaque semaine
+    </div>
+    <div class="photo-grid">
+      <div class="photo-btn" id="photo-avant" onclick="prendrePhoto('avant')">
+        <div class="icon">📸</div><div>Avant</div>
+      </div>
+      <div class="photo-btn" id="photo-arriere" onclick="prendrePhoto('arriere')">
+        <div class="icon">📸</div><div>Arrière</div>
+      </div>
+      <div class="photo-btn" id="photo-gauche" onclick="prendrePhoto('gauche')">
+        <div class="icon">📸</div><div>Côté gauche</div>
+      </div>
+      <div class="photo-btn" id="photo-droite" onclick="prendrePhoto('droite')">
+        <div class="icon">📸</div><div>Côté droit</div>
+      </div>
+    </div>
+    <button class="btn-main btn-photo" onclick="envoyerPhotos()" style="margin:10px 0 0;border-radius:10px">
+      ✅ Envoyer le check
+    </button>
+  </div>
+
+  <!-- Tableau de bord véhicule en temps réel -->
+  <div class="section-title">🚗 Mon véhicule — temps réel</div>
+  <div class="card" id="card-veh-dash">
+    <div id="veh-loading" style="text-align:center;padding:20px;color:#888;font-size:13px">
+      Chargement données GPS…
+    </div>
+    <div id="veh-data" style="display:none">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px">
+        <div style="background:#f5f4f0;border-radius:8px;padding:10px;text-align:center">
+          <div style="font-size:22px;font-weight:700;color:#185FA5" id="veh-vitesse">0 km/h</div>
+          <div style="font-size:10px;color:#888;margin-top:2px">Vitesse actuelle</div>
+        </div>
+        <div style="background:#f5f4f0;border-radius:8px;padding:10px;text-align:center">
+          <div style="font-size:22px;font-weight:700;color:#1D9E75" id="veh-compteur">— km</div>
+          <div style="font-size:10px;color:#888;margin-top:2px">Compteur total</div>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px">
+        <div style="background:#f5f4f0;border-radius:8px;padding:8px;text-align:center">
+          <div id="veh-carburant-ico" style="font-size:18px">⛽</div>
+          <div style="font-size:13px;font-weight:600" id="veh-carburant">—%</div>
+          <div style="font-size:9px;color:#888">Carburant</div>
+          <div style="height:4px;background:#e0dfd8;border-radius:2px;margin-top:4px">
+            <div id="veh-carburant-bar" style="height:100%;background:#1D9E75;border-radius:2px;width:0%"></div>
+          </div>
+        </div>
+        <div style="background:#f5f4f0;border-radius:8px;padding:8px;text-align:center">
+          <div style="font-size:18px" id="veh-signal-ico">📶</div>
+          <div style="font-size:13px;font-weight:600" id="veh-signal">—</div>
+          <div style="font-size:9px;color:#888">Signal GPS</div>
+        </div>
+        <div style="background:#f5f4f0;border-radius:8px;padding:8px;text-align:center">
+          <div style="font-size:18px" id="veh-moteur-ico">🔑</div>
+          <div style="font-size:13px;font-weight:600" id="veh-moteur">—</div>
+          <div style="font-size:9px;color:#888">Moteur</div>
+        </div>
+      </div>
+      <div style="margin-top:8px;padding:6px 10px;background:#E6F1FB;border-radius:8px;font-size:10px;color:#0C447C">
+        <span id="veh-position">Position : en attente…</span> · <span id="veh-maj">Mis à jour : —</span>
+      </div>
+    </div>
+    <div id="veh-no-gps" style="display:none;text-align:center;padding:16px;font-size:12px;color:#888">
+      GPS non connecté pour ce véhicule.<br>Contactez votre gestionnaire.
+    </div>
+  </div>
+
+  <!-- Historique factures -->
+  <div class="section-title">📋 Dernières factures</div>
+  <div class="card" id="list-factures"><div class="loading">Chargement…</div></div>
+
+  <!-- Derniers versements -->
+  <div class="section-title">💰 Derniers versements</div>
+  <div class="card" id="list-versements"><div class="loading">Chargement…</div></div>
+
+  <div style="height:30px"></div>
+</div>
+
+<script>
+// ── Config ────────────────────────────────────────────────────────────
+// L'app chauffeur appelle l'API SyNdongo (même serveur)
+// Sur Render : https://syndongoflotte.onrender.com
+// En local : http://localhost:3000
+var API_BASE = window.location.origin;
+
+var _chauffeurId = localStorage.getItem('snd_ch_id') || '';
+var _photoData = {};
+
+function fmt(n) {
+  if (!n) return '0 F';
+  return Number(n).toLocaleString('fr-FR') + ' F';
+}
+
+// ── Login par téléphone ───────────────────────────────────────────────
+async function seConnecter() {
+  var tel = document.getElementById('login-tel').value.trim();
+  if (!tel) { document.getElementById('login-err').textContent = 'Entrez votre numéro'; return; }
+  // Chercher le chauffeur par téléphone
+  var r = await fetch(API_BASE + '/api/chauffeurs');
+  var chauffeurs = await r.json();
+  var ch = chauffeurs.find(function(c) {
+    return (c.telephone||'').replace(/\s/g,'') === tel.replace(/\s/g,'') ||
+           (c.telephone||'').endsWith(tel.slice(-9));
+  });
+  if (!ch) {
+    document.getElementById('login-err').textContent = '❌ Numéro non trouvé — contactez votre gestionnaire';
+    return;
+  }
+  localStorage.setItem('snd_ch_id', ch.id);
+  _chauffeurId = ch.id;
+  afficherDash();
+}
+
+function seDeconnecter() {
+  localStorage.removeItem('snd_ch_id');
+  _chauffeurId = '';
+  document.getElementById('login-view').classList.remove('hidden');
+  document.getElementById('dash-view').classList.add('hidden');
+}
+
+// ── Afficher le dashboard ─────────────────────────────────────────────
+async function afficherDash() {
+  document.getElementById('login-view').classList.add('hidden');
+  document.getElementById('dash-view').classList.remove('hidden');
+  var r = await fetch(API_BASE + '/api/chauffeur/dashboard/' + _chauffeurId);
+  var d = await r.json();
+  if (!d || d.detail) {
+    document.getElementById('login-err').textContent = 'Erreur de chargement';
+    seDeconnecter(); return;
+  }
+  var ch = d.chauffeur;
+  var veh = d.vehicule;
+  document.getElementById('dash-nom').textContent = '👤 ' + ch.nom;
+  document.getElementById('dash-veh').textContent = veh ? veh.immatriculation + ' ' + veh.marque : 'Sans véhicule';
+  document.getElementById('kpi-dette').textContent = fmt(d.dette_globale);
+  document.getElementById('kpi-verse').textContent = fmt(d.mois.verse);
+  document.getElementById('kpi-fac').textContent = fmt(d.mois.facture);
+  document.getElementById('kpi-km').textContent = (d.mois.km||0) + ' km';
+
+  // Rafraîchir le dashboard véhicule
+  setTimeout(loadVehiculeData, 500);
+
+  // Alertes
+  if (d.dette_globale > 0) {
+    var ar = document.getElementById('alerte-retard');
+    ar.textContent = '⏰ Vous avez ' + fmt(d.dette_globale) + ' de retard — régularisez dès que possible';
+    ar.classList.remove('hidden');
+  }
+
+  // Factures
+  var listFac = document.getElementById('list-factures');
+  var facs = d.dernieres_factures || [];
+  listFac.innerHTML = facs.length ? facs.slice(0,8).map(function(f) {
+    var badge = f.type_journee === 'journee_complete' ? '<span class="badge ok">Journée</span>' :
+                f.type_journee === 'demi_journee' ? '<span class="badge part">½ journée</span>' :
+                '<span class="badge ok">'+f.type_journee+'</span>';
+    var gps = f.source_gps ? ' <span style="font-size:10px;color:#185FA5">📡GPS</span>' : '';
+    return '<div class="fact-item"><span>' + f.date + gps + '</span>' + badge +
+      '<strong>' + fmt(f.montant_facture) + '</strong></div>';
+  }).join('') : '<div style="color:#888;font-size:13px">Aucune facture</div>';
+
+  // Versements
+  var listVers = document.getElementById('list-versements');
+  var vers = d.derniers_versements || [];
+  listVers.innerHTML = vers.length ? vers.slice(0,5).map(function(v) {
+    var mode = v.mode_paiement === 'wave' ? '📱 Wave' :
+               v.mode_paiement === 'orange_money' ? '📱 OM' : '💵 Espèces';
+    return '<div class="fact-item"><span>' + (v.date_versement||'') + ' ' + mode + '</span>' +
+      '<strong style="color:#3B6D11">' + fmt(v.montant) + '</strong></div>';
+  }).join('') : '<div style="color:#888;font-size:13px">Aucun versement</div>';
+}
+
+// ── Paiements ─────────────────────────────────────────────────────────
+async function payerWave() {
+  // Rediriger vers Wave avec le montant de la dette
+  var r = await fetch(API_BASE + '/api/chauffeur/dashboard/' + _chauffeurId);
+  var d = await r.json();
+  var montant = d.dette_globale || 0;
+  if (!montant) { alert('Aucune dette à régler !'); return; }
+  // Lien Wave Sénégal — remplacer par le vrai numéro Wave de la flotte
+  var msg = encodeURIComponent('Versement flotte SyNdongo - ' + d.chauffeur.nom);
+  var waveUrl = 'https://wave.com/send?amount='+montant+'&note='+msg;
+  // Simuler — en prod : window.open(waveUrl)
+  if (confirm('Payer ' + d.dette_globale.toLocaleString() + ' F par Wave ?\nVous allez être redirigé vers Wave.')) {
+    window.open(waveUrl, '_blank');
+  }
+}
+
+async function payerOM() {
+  var r = await fetch(API_BASE + '/api/chauffeur/dashboard/' + _chauffeurId);
+  var d = await r.json();
+  var montant = d.dette_globale || 0;
+  if (!montant) { alert('Aucune dette à régler !'); return; }
+  alert('Pour payer par Orange Money :\nEnvoyez ' + montant.toLocaleString() + ' F au numéro de votre gestionnaire.');
+}
+
+// ── Photos check ──────────────────────────────────────────────────────
+function prendrePhoto(side) {
+  // Forcer la caméra arrière UNIQUEMENT — pas d'accès à la galerie
+  // capture='environment' = caméra arrière, accept sans 'image/*' alone
+  var input = document.createElement('input');
+  input.type = 'file';
+  input.accept = 'image/jpeg,image/png'; // Types stricts — pas de vidéo
+  input.capture = 'environment'; // Caméra arrière obligatoire
+  // Note: sur iOS/Android, capture='environment' ouvre directement la caméra
+  // et bloque l'accès à la galerie de photos
+  input.onchange = function(e) {
+    var file = e.target.files[0];
+    if (!file) return;
+    // Vérifier que c'est bien une photo (pas un fichier importé depuis la galerie)
+    // On vérifie que le fichier a été pris maintenant (moins de 60s)
+    var now = new Date();
+    var fileDate = new Date(file.lastModified);
+    var diffSec = (now - fileDate) / 1000;
+    if (diffSec > 120) {
+      alert('Photo refusée — vous devez prendre une photo maintenant, pas importer depuis la galerie.');
+      return;
+    }
+    var reader = new FileReader();
+    reader.onload = function(ev) {
+      // Stocker la photo (base64 compressée)
+      var img = new Image();
+      img.onload = function() {
+        var canvas = document.createElement('canvas');
+        var maxW = 800; var ratio = maxW / img.width;
+        canvas.width = maxW; canvas.height = img.height * ratio;
+        canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+        _photoData[side] = {
+          data: canvas.toDataURL('image/jpeg', 0.75),
+          timestamp: now.toISOString(),
+          filename: file.name,
+          size: file.size
+        };
+        var btn = document.getElementById('photo-' + side);
+        btn.classList.add('done');
+        btn.querySelector('.icon').textContent = '✅';
+        btn.querySelector('div').textContent = 'Pris à ' + now.toLocaleTimeString('fr-FR', {hour:'2-digit',minute:'2-digit'});
+        // Aperçu miniature
+        var prev = document.createElement('img');
+        prev.src = _photoData[side].data;
+        prev.style.cssText = 'width:50px;height:50px;object-fit:cover;border-radius:6px;margin-top:4px';
+        btn.appendChild(prev);
+      };
+      img.src = ev.target.result;
+    };
+    reader.readAsDataURL(file);
+  };
+  input.click();
+}
+
+async function envoyerPhotos() {
+  var sides = ['avant','arriere','gauche','droite'];
+  var nb = sides.filter(function(s){ return _photoData[s]; }).length;
+  if (nb < 4) {
+    alert('Prenez les 4 photos avant d\'envoyer ('+nb+'/4 faites)\n\nRestant : '+
+      sides.filter(function(s){ return !_photoData[s]; }).join(', '));
+    return;
+  }
+  // Construire le payload avec toutes les photos + timestamps
+  var semaine = new Date().toISOString().split('T')[0];
+  var photosPayload = {};
+  sides.forEach(function(s) {
+    if (_photoData[s]) photosPayload[s] = {
+      data: _photoData[s].data,
+      timestamp: _photoData[s].timestamp,
+      filename: _photoData[s].filename
+    };
+  });
+  var btn_send = document.querySelector('.btn-photo');
+  if (btn_send) { btn_send.textContent = 'Envoi en cours…'; btn_send.disabled = true; }
+  var r = await fetch(API_BASE + '/api/chauffeur/photo-check', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chauffeur_id: _chauffeurId,
+      semaine: semaine,
+      photos: photosPayload,
+      gps_timestamp: new Date().toISOString()
+    })
+  });
+  if (btn_send) { btn_send.textContent = '✅ Envoyer le check'; btn_send.disabled = false; }
+  var d = await r.json();
+  if (d.ok) {
+    alert('✅ Check hebdomadaire envoyé ! Merci.');
+    _photoData = {};
+    sides.forEach(function(s) {
+      var btn = document.getElementById('photo-'+s);
+      btn.classList.remove('done');
+      var imgs = btn.querySelectorAll('img');
+      imgs.forEach(function(i){ i.remove(); });
+      btn.querySelector('.icon').textContent = '📸';
+      btn.querySelector('div').textContent = s.charAt(0).toUpperCase()+s.slice(1);
+    });
+  }
+}
+
+// ── Dashboard véhicule temps réel ────────────────────────────────────
+async function loadVehiculeData() {
+  var vehEl = document.getElementById('veh-data');
+  var loadEl = document.getElementById('veh-loading');
+  var noGpsEl = document.getElementById('veh-no-gps');
+  if (!vehEl) return;
+
+  // Récupérer les données GPS du véhicule depuis SyNdongo (qui les a sync depuis Ezzloc)
+  var r = await fetch(API_BASE + '/api/chauffeur/dashboard/' + _chauffeurId);
+  var d = await r.json();
+  if (!d || !d.vehicule) {
+    if (loadEl) loadEl.style.display = 'none';
+    if (noGpsEl) noGpsEl.style.display = 'block';
+    return;
+  }
+  var veh = d.vehicule;
+  var vidId = veh.id;
+
+  // Charger les km GPS du jour
+  var today = new Date().toISOString().split('T')[0];
+  var kmR = await fetch(API_BASE + '/api/gps/km?vehicule_id=' + vidId + '&date=' + today);
+  var kmData = await kmR.json();
+  var km = Array.isArray(kmData) && kmData.length ? kmData[0] : null;
+
+  if (loadEl) loadEl.style.display = 'none';
+  if (vehEl) vehEl.style.display = 'block';
+
+  // Mettre à jour les valeurs
+  var vitesse = km ? (km.vitesse_max || 0) : 0;
+  var compteur = veh.km_actuel || 0;
+  var heures = km ? km.heures_travail : 0;
+
+  var v = document.getElementById('veh-vitesse');
+  if (v) v.textContent = vitesse + ' km/h';
+
+  var c = document.getElementById('veh-compteur');
+  if (c) c.textContent = compteur.toLocaleString('fr-FR') + ' km';
+
+  // Carburant — depuis les données Ezzloc si disponibles
+  var carb = km && km.carburant !== undefined ? km.carburant : null;
+  var carbEl = document.getElementById('veh-carburant');
+  var carbBar = document.getElementById('veh-carburant-bar');
+  var carbIco = document.getElementById('veh-carburant-ico');
+  if (carb !== null && carbEl) {
+    carbEl.textContent = carb + '%';
+    if (carbBar) carbBar.style.width = carb + '%';
+    if (carbBar) carbBar.style.background = carb < 20 ? '#A32D2D' : carb < 40 ? '#BA7517' : '#1D9E75';
+    if (carbIco && carb < 20) carbIco.textContent = '⚠️';
+  } else if (carbEl) {
+    carbEl.textContent = 'Non dispo';
+  }
+
+  // Signal GPS
+  var sigEl = document.getElementById('veh-signal');
+  var sig = km ? (km.signal || 'Bon') : 'Inconnu';
+  if (sigEl) sigEl.textContent = sig;
+
+  // Moteur
+  var motEl = document.getElementById('veh-moteur');
+  var motIco = document.getElementById('veh-moteur-ico');
+  var motOn = km && km.moteur_allume !== undefined ? km.moteur_allume : null;
+  if (motEl) motEl.textContent = motOn === true ? 'Allumé' : motOn === false ? 'Éteint' : '—';
+  if (motIco) motIco.textContent = motOn ? '🟢' : motOn === false ? '🔴' : '🔑';
+
+  // Position
+  var posEl = document.getElementById('veh-position');
+  if (posEl && km && km.derniere_position) posEl.textContent = 'Position : ' + km.derniere_position;
+
+  var majEl = document.getElementById('veh-maj');
+  if (majEl) majEl.textContent = 'Mis à jour : ' + new Date().toLocaleTimeString('fr-FR');
+
+  // Vérifier vidange
+  if (veh.km_prochain_vidange && compteur >= veh.km_prochain_vidange * 0.95) {
+    var alertDiv = document.getElementById('alerte-vidange');
+    if (alertDiv) {
+      alertDiv.textContent = '⚠️ Vidange à faire bientôt — ' + compteur.toLocaleString() + ' / ' + veh.km_prochain_vidange.toLocaleString() + ' km';
+      alertDiv.classList.remove('hidden');
+    }
+  }
+}
+
+// ── Init ──────────────────────────────────────────────────────────────
+if (_chauffeurId) {
+  afficherDash();
+  loadVehiculeData();
+  // Rafraîchir les données véhicule toutes les 2 minutes
+  setInterval(loadVehiculeData, 120000);
+}
+</script>
+</body>
+</html>
