@@ -423,7 +423,7 @@ tr:hover td{background:#fafaf8}
         </div>
         <div class="form-row">
           <div class="field"><label>Km prochain vidange</label><input id="vvid" type="number" placeholder="85000"></div>
-          <div class="field"><label>IMEI GPS (boîtier Ezzloc)</label><input id="vimei" placeholder="Ex: 358899051025339" maxlength="20"></div>
+          <div class="field"><label>ID du dispositif Ezzloc</label><input id="vimei" placeholder="Ex: 12345678 (voir Ezzloc → Éditer équipement)" maxlength="30"></div>
           <div class="field"><label>Tag / Groupe</label><select id="vtag"><option value="">— Aucun —</option></select><div id="vtag-gest-note" style="display:none;font-size:10px;color:#3C3489;margin-top:3px">🏷️ Tag de votre groupe pré-sélectionné</div></div>
         </div>
         <div class="form-row">
@@ -1184,9 +1184,9 @@ tr:hover td{background:#fafaf8}
     <div class="form-row"><div class="field"><label>Km actuel</label><input id="ev-km" type="number"></div><div class="field"><label>Km vidange</label><input id="ev-vid" type="number"></div></div>
     <div class="form-row"><div class="field"><label>Tag</label><select id="ev-tag"><option value="">— Aucun —</option></select></div><div class="field"><label>Statut</label><select id="ev-st"><option value="actif">Actif</option><option value="en_maintenance">En maintenance</option><option value="en_panne">En panne</option></select></div></div>
     <div class="field" style="margin-bottom:8px">
-      <label>IMEI GPS (boîtier Ezzloc)</label>
-      <input id="ev-imei" placeholder="Ex: 358899051025339" maxlength="20" style="font-family:monospace">
-      <div style="font-size:10px;color:#6b6b67;margin-top:3px">Trouvez l'IMEI sur Ezzloc → liste de vos appareils</div>
+      <label>ID du dispositif Ezzloc</label>
+      <input id="ev-imei" placeholder="Ex: 12345678 (Ezzloc → Éditer → ID du dispositif)" maxlength="30" style="font-family:monospace">
+      <div style="font-size:10px;color:#6b6b67;margin-top:3px">Trouvez l'ID dans Ezzloc → cliquer sur un véhicule → Éditer → champ "ID du dispositif"</div>
     </div>
     <div class="field" style="margin-bottom:14px"><label>Propriétaire</label><select id="ev-prop"><option value="">— Aucun —</option></select></div>
     <div style="display:flex;gap:10px;justify-content:flex-end">
