@@ -3,7 +3,9 @@ const fs = require('fs');
 const path = require('path');
 const url = require('url');
 
-const DB_FILE = process.env.DATA_PATH || './syndongo_data.json';
+// Mode test : si RENDER_FREE=true, stocker en mémoire (pas de disque requis)
+const IS_FREE_TIER = process.env.RENDER_FREE === 'true';
+const DB_FILE = IS_FREE_TIER ? '/tmp/syndongo_test.json' : (process.env.DATA_PATH || './syndongo_data.json');
 const PORT = process.env.PORT || 8000;
 
 // ── Helpers tags ──────────────────────────────────────────
@@ -67,6 +69,10 @@ function verifyWaveSignature(body, signature) {
 }
 
 function loadDB() {
+  // En mode gratuit : la DB est en /tmp (perdue au redémarrage — OK pour les tests)
+  if (IS_FREE_TIER && !fs.existsSync('/tmp')) {
+    // /tmp existe toujours sur Render — rien à faire
+  }
   if (!fs.existsSync(DB_FILE)) {
     const dir = path.dirname(DB_FILE);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });

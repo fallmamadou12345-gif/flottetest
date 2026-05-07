@@ -4,10 +4,11 @@ services:
     env: node
     buildCommand: npm install
     startCommand: node serveur.js
+    plan: free
     envVars:
-      - key: DATA_PATH
-        value: /data/syndongo_test.json
-    disk:
-      name: syndongo-test-data
-      mountPath: /data
-      sizeGB: 1
+      - key: RENDER_FREE
+        value: "true"
+      - key: PORT
+        value: "10000"
+    # Pas de disque persistant = instance gratuite sans carte de crédit
+    # Les donnees de test sont stockees en /tmp et remises a zero au redemarrage
