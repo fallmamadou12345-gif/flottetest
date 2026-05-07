@@ -1255,6 +1255,12 @@ async function handleAPI(req, res, body) {
       derniere_position: data.derniere_position||'',
       latitude: data.latitude||null,
       longitude: data.longitude||null,
+      // Horaires de travail (depuis Ezzloc ou saisie)
+      heure_debut: data.heure_debut||null,    // Ex: "06:30"
+      heure_fin: data.heure_fin||null,        // Ex: "20:15"
+      // Trajets du jour
+      nb_trajets: data.nb_trajets||0,
+      trajet_plus_long: data.trajet_plus_long||0,
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString()
     };
@@ -1322,6 +1328,41 @@ async function handleAPI(req, res, body) {
       gps_today: last,
       derniere_maj: last ? last.updated_at||last.created_at : null
     }));
+  }
+
+  // GET /api/gps/distances — km agrégés par jour/semaine/mois/année
+  if(p==='/api/gps/distances'&&method==='GET'){
+    if(!auth.role||auth.role==='public'){res.writeHead(403);return res.end(JSON.stringify({detail:'Refusé'}));}
+    const vehs = vehsVisibles(db, auth);
+    const vIds = vehs.map(v=>v.id);
+    let kmList = (db.gps_km_journaliers||[]).filter(k=>vIds.includes(k.vehicule_id));
+    const debut = q.date_debut||''; const fin = q.date_fin||'';
+    const mode = q.mode||'mois'; // jour, semaine, mois, annee
+    const vid = q.vehicule_id||'';
+    if(debut) kmList=kmList.filter(k=>k.date>=debut);
+    if(fin)   kmList=kmList.filter(k=>k.date<=fin);
+    if(vid)   kmList=kmList.filter(k=>k.vehicule_id===vid);
+
+    // Agréger
+    const groups = {};
+    kmList.forEach(k=>{
+      let key;
+      if(mode==='jour') key = k.date;
+      else if(mode==='semaine') { const d=new Date(k.date); const w=Math.ceil((((d-new Date(d.getFullYear(),0,1))/86400000)+new Date(d.getFullYear(),0,1).getDay()+1)/7); key=d.getFullYear()+'-S'+String(w).padStart(2,'0'); }
+      else if(mode==='mois') key = k.date.substring(0,7);
+      else key = k.date.substring(0,4);
+      const gKey = vid ? key : k.vehicule_id+'|'+key;
+      if(!groups[gKey]) groups[gKey]={key,vehicule_id:k.vehicule_id,km:0,heures:0,jours:0,heure_debut:null,heure_fin:null};
+      groups[gKey].km += k.km_parcourus||0;
+      groups[gKey].heures += k.heures_travail||0;
+      groups[gKey].jours++;
+      if(k.heure_debut&&(!groups[gKey].heure_debut||k.heure_debut<groups[gKey].heure_debut)) groups[gKey].heure_debut=k.heure_debut;
+      if(k.heure_fin&&(!groups[gKey].heure_fin||k.heure_fin>groups[gKey].heure_fin)) groups[gKey].heure_fin=k.heure_fin;
+    });
+    const result = Object.values(groups).map(g=>({...g,
+      veh: vehs.find(v=>v.id===g.vehicule_id)||null
+    })).sort((a,b)=>b.km-a.km);
+    return res.end(JSON.stringify(result));
   }
 
   // GET /api/gps/stats — statistiques km par véhicule sur période

@@ -2364,13 +2364,17 @@ async function loadVehicules() {
     }
     const actions = isM ? '<td style="display:flex;gap:3px;flex-wrap:wrap">' +
       '<button class="btn-sm btn-blue" onclick="ouvrirFicheVeh(\'' + v.id + '\')">Fiche</button>' +
+      '<button class="btn-sm" style="background:#E6F1FB;color:#0C447C" onclick="majKmRapide(\'' + v.id + '\',\'' + v.immatriculation + '\',' + (v.km_actuel||0) + ')" title="Mettre à jour le compteur km">km</button>' +
       '<button class="btn-sm" style="background:#EAF3DE;color:#27500A" onclick=\'editVeh(' + JSON.stringify(v) + ')\'>Modif.</button>' +
       '<button class="btn-sm" style="background:#FCEBEB;color:#A32D2D" onclick="delVeh(\'' + v.id + '\',\'' + v.immatriculation + '\')">Suppr.</button>' +
       '</td>' : '';
     return '<tr><td onclick="ouvrirFicheVeh(\'' + v.id + '\')" style="cursor:pointer;color:#185FA5;font-weight:700">' + v.immatriculation + '</td>' +
       '<td>' + v.marque + ' ' + (v.modele || '') + '</td>' +
       '<td>' + (v.tag ? pill(v.tag, 'purple') : '—') + '</td>' +
-      '<td>' + ((v.km_actuel || 0)).toLocaleString('fr-FR') + ' km' + (v.alerte_vidange ? ' ' + pill('Vidange!', 'warn') : '') + '</td>' +
+      '<td>' + (v.km_actuel > 0
+        ? (v.km_actuel).toLocaleString('fr-FR') + ' km' + (v.alerte_vidange ? ' ' + pill('Vidange!', 'warn') : '')
+        : '<span style="color:#A32D2D;font-size:11px;cursor:pointer" onclick="majKmRapide(\'' + v.id + '\',\'' + v.immatriculation + '\',0)" title="Cliquer pour saisir le km">0 km ✏️</span>'
+      ) + '</td>' +
       '<td>' + pill(v.statut, v.statut === 'actif' ? 'ok' : v.statut === 'en_panne' ? 'err' : 'warn') + '</td>' +
       '<td>' + sjCell + '</td>' + actions + '</tr>';
   }).join('');
@@ -2407,6 +2411,22 @@ async function addVehicule(btn) {
   toast('Véhicule ' + immat.toUpperCase() + ' enregistré');
   ['vi', 'vm', 'vmo', 'vvid', 'vimei'].forEach(function(id) { var el = document.getElementById(id); if(el) el.value = ''; });
   loadVehicules(); refreshSelects();
+}
+
+// ── Mise à jour km rapide depuis la liste ────────────────────────────
+async function majKmRapide(id, immat, kmActuel) {
+  var nouveau = prompt(immat + ' - Km actuel (' + (kmActuel||0).toLocaleString('fr-FR') + ' km) :', kmActuel || '');
+  if (nouveau === null) return; // Annulé
+  var km = parseInt(nouveau.replace(/[^0-9]/g, ''));
+  if (isNaN(km) || km < 0) { toast('Km invalide', 'err'); return; }
+  if (km < kmActuel && !confirm('Le nouveau km (' + km.toLocaleString('fr-FR') + ') est inférieur à l\'actuel (' + (kmActuel||0).toLocaleString('fr-FR') + '). Continuer ?')) return;
+  var r = await api('PATCH', '/vehicules/' + id, { km_actuel: km });
+  if (r && !r.detail) {
+    toast('✅ ' + immat + ' — Compteur mis à jour : ' + km.toLocaleString('fr-FR') + ' km');
+    loadVehicules();
+  } else {
+    toast('Erreur : ' + (r.detail || 'inconnu'), 'err');
+  }
 }
 
 async function delVeh(id, immat) {
