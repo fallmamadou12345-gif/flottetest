@@ -423,6 +423,7 @@ tr:hover td{background:#fafaf8}
         </div>
         <div class="form-row">
           <div class="field"><label>Km prochain vidange</label><input id="vvid" type="number" placeholder="85000"></div>
+          <div class="field"><label>IMEI GPS (boîtier Ezzloc)</label><input id="vimei" placeholder="Ex: 358899051025339" maxlength="20"></div>
           <div class="field"><label>Tag / Groupe</label><select id="vtag"><option value="">— Aucun —</option></select><div id="vtag-gest-note" style="display:none;font-size:10px;color:#3C3489;margin-top:3px">🏷️ Tag de votre groupe pré-sélectionné</div></div>
         </div>
         <div class="form-row">
@@ -1182,6 +1183,11 @@ tr:hover td{background:#fafaf8}
     <div class="form-row"><div class="field"><label>Modèle</label><input id="ev-mo"></div><div class="field"><label>Année</label><input id="ev-an" type="number"></div></div>
     <div class="form-row"><div class="field"><label>Km actuel</label><input id="ev-km" type="number"></div><div class="field"><label>Km vidange</label><input id="ev-vid" type="number"></div></div>
     <div class="form-row"><div class="field"><label>Tag</label><select id="ev-tag"><option value="">— Aucun —</option></select></div><div class="field"><label>Statut</label><select id="ev-st"><option value="actif">Actif</option><option value="en_maintenance">En maintenance</option><option value="en_panne">En panne</option></select></div></div>
+    <div class="field" style="margin-bottom:8px">
+      <label>IMEI GPS (boîtier Ezzloc)</label>
+      <input id="ev-imei" placeholder="Ex: 358899051025339" maxlength="20" style="font-family:monospace">
+      <div style="font-size:10px;color:#6b6b67;margin-top:3px">Trouvez l'IMEI sur Ezzloc → liste de vos appareils</div>
+    </div>
     <div class="field" style="margin-bottom:14px"><label>Propriétaire</label><select id="ev-prop"><option value="">— Aucun —</option></select></div>
     <div style="display:flex;gap:10px;justify-content:flex-end">
       <button class="btn btn-gray" onclick="fermer('m-edit-veh')">Annuler</button>
@@ -2391,6 +2397,7 @@ async function addVehicule(btn) {
     annee: +document.getElementById('van').value,
     km_actuel: +document.getElementById('vkm').value,
     km_prochain_vidange: +document.getElementById('vvid').value || null,
+    imei: (document.getElementById('vimei')||{}).value || '',
     tag: document.getElementById('vtag').value,
     statut: document.getElementById('vst').value,
     proprio_id: document.getElementById('vprop').value || null
@@ -2398,7 +2405,7 @@ async function addVehicule(btn) {
   setBtnLoad(btn, false);
   if (r.detail) { toast(r.detail, 'err'); return; }
   toast('Véhicule ' + immat.toUpperCase() + ' enregistré');
-  ['vi', 'vm', 'vmo', 'vvid'].forEach(function(id) { document.getElementById(id).value = ''; });
+  ['vi', 'vm', 'vmo', 'vvid', 'vimei'].forEach(function(id) { var el = document.getElementById(id); if(el) el.value = ''; });
   loadVehicules(); refreshSelects();
 }
 
@@ -2418,6 +2425,8 @@ function editVeh(v) {
   document.getElementById('ev-km').value = v.km_actuel || 0;
   document.getElementById('ev-vid').value = v.km_prochain_vidange || '';
   document.getElementById('ev-st').value = v.statut;
+  var evImei = document.getElementById('ev-imei');
+  if (evImei) evImei.value = v.imei || '';
   loadTags().then(function() { document.getElementById('ev-tag').value = v.tag || ''; });
   refreshPropSelect('ev-prop').then(function() {
     api('GET', '/proprietaires').then(function(props) {
@@ -2440,6 +2449,7 @@ async function saveVeh(btn) {
     km_prochain_vidange: +document.getElementById('ev-vid').value || null,
     statut: document.getElementById('ev-st').value,
     tag: document.getElementById('ev-tag').value,
+    imei: (document.getElementById('ev-imei')||{}).value || '',
     proprio_id: document.getElementById('ev-prop').value || null
   });
   setBtnLoad(btn, false);
